@@ -7,7 +7,7 @@
 | 日期 | 2026-09-07 |
 | 影响范围 | `jiuwen_memory/common/security/`、`jiuwen_memory/common/audit/`、`jiuwen_memory/api/`、`jiuwen_memory_entry/core/`、`jiuwen_memory_entry/mcp_server/transport_security.py`、`docs/specs/S02-memory-api.md`、`docs/specs/S07-common.md` |
 | 关联文档 | [S02 记忆接口层](../../specs/S02-memory-api.md)、[S07 公共组件层](../../specs/S07-common.md)、[F05 公共安全架构](../../../security-plans/F05-common-security-architecture.md)、[PR1/PR2 接口说明文档](../../../security-plans/2026-08-17-PR1-PR2-接口说明文档.md)、[F04 安全接口与加密设计](F04-security-interfaces-and-encryption.md) |
-| 状态 | **PR1 实装已交付并适配 2026-09-20 上游**：dev / trusted / api_key、接入保护与静态加密均已接线；HTTP / CLI 默认 `required`，只有显式 dev 才启用固定本地身份；PR2/PR3 实现仍待合入 |
+| 状态 | PR1 已同步 2026-09-20 上游；PR2 合入该基线并关闭 SDK 凭据装配、具名角色与代理代写缺口，验证范围见 F12；PR3 未实装。HTTP / CLI / MCP 默认 required，DEV 须显式启用 |
 
 ## 1. 背景与目标
 
@@ -100,14 +100,14 @@ http.dev_identities；已显式配置 memory_api.security 时保留该运行时�
 
 ## 4. 实装清单（原「暂缓合入清单」）
 
-PR1 项已交付；PR2 / PR3 项仍待各自实装 PR：
+PR1、PR2 项已交付并通过契约验收，PR3 仍待实装：
 
 - [x] `authentication_impl/`（dev / trusted / api_key 三种 Authenticator 及 KeyStore 后端）
 - [x] `cryptography_impl/`（`local` KeyProvider 与 ENC1 信封 provider，v2 写出 / v1 只读兼容）
 - [x] 上述接缝接入实际 Server lifecycle（HTTP / MCP / CLI）
 - [x] `validate_actor_form()` actor 全局形态校验（纯增量公开函数，`authenticated()` 认证边界执行；不改变任何既有签名）
-- [ ] PR2：`authorization_impl/`（`Authorizer` / `GrantStore` / `DelegationStore` 后端）、
-  `RequestSecurityContext` 受控来源的 PEP 校验、`dispatch` 的 `security=` 过渡参数改为必填，
+- [x] PR2（最终验收通过）：`authorization_impl/`（`Authorizer` / `GrantStore` / `DelegationStore` 后端）、
+  `RequestSecurityContext` 受控来源的 PEP 校验、`dispatch` 的 `security=` 参数必填，
   以及删除过渡桥 `common/security/legacy.py` 与全部 `legacy_request_context(...)` 调用点
   （`MemoryAPI` 公开签名已在 PR1 切到 `security=`，余下的是 `dispatch` 与进程内调用方）
 - [ ] PR3：`audit_integrity_impl/`（版本化规范化 + 链式 HMAC 的 `AuditIntegrityProvider`；内存 /
@@ -148,8 +148,8 @@ authenticator 产出，不接受调用方以 `Scope` 自述身份，也不再有
 | `scope_covers` | 主体路径感知的 Scope 覆盖判定（`authorization/scope_rules.py`） |
 
 `api` 包的 `Grant`/`Action` 导出切到安全域类型；`control.types` 为兼容既有导入路径
-再导出同一对象，不再定义第二套四字段 Grant / 五成员 Action。API 将同一 Grant 实例
-交给过渡期 `PermissionManager`，不做会丢弃 `grant_id` / `revoked` 的结构转换。
+再导出同一对象，不再定义第二套四字段 Grant / 五成员 Action。PR2 的 API 将同一 Grant
+值对象写入与 Authorizer 同源的 GrantStore，不做会丢弃 `grant_id` / `revoked` 的结构转换。
 
 ### 5.3 `MemoryAPI` 公开签名：`identity: Scope` → `security: RequestSecurityContext`
 
@@ -163,10 +163,11 @@ authenticator 产出，不接受调用方以 `Scope` 自述身份，也不再有
 | `grant(grant, *, security) -> Grant` | 返回值携带该授权的 `grant_id`，供后续精确撤销 |
 | `revoke(grant, *, security) -> None` | 按 `grant.grant_id` 精确回收（幂等） |
 
-### 5.4 当前过渡行为（与目标接口的差异）
+### 5.4 PR1 历史过渡行为与 PR2 收敛结果
 
-正式接口如上，但 PR1 只交付认证与加密，**不启用**任何新授权实现：判定链路仍是原有的
-`PermissionManager`。以下差异是已知的过渡态，PR2 收敛：
+正式接口如上。下表仅记录早期 PR1 交付时的历史过渡基线；PR2 已完整收敛这些差异。
+最新 PR1 的 MCP 也已改经 `api_contract.invoke_api` 直调，不能把表中的旧 dispatch
+路径当作当前接入路径：
 
 | 项 | 目标形态 | 当前过渡行为 |
 |---|---|---|
@@ -181,6 +182,11 @@ authenticator 产出，不接受调用方以 `Scope` 自述身份，也不再有
 等于用接口语义掩盖实际的条件撤销。因此本期只固定签名，不产出 ID、不据 ID 判定，
 待 `GrantStore` 落地时一并启用（届时补反向测试：未知/错误 ID 不得撤销其他 Grant）。
 
+**收敛状态（PR2 整改后）**：上表所列差异已全部消除——判定统一走 `Authorizer`
+（不变量 23）、`revoke` 按 `REVOKE_SHARE` 鉴权、`grant_id` 服务端生成并写入具名
+`GrantStore`、撤销按 ID 精确（未知 ID 幂等无副作用）、管理面动作由 Authorizer 角色闸门
+判定；`legacy_request_adapter` 不再从 payload 自述 actor，`dispatch.security` 必填。
+
 ### 5.5 `Grant` 公共导出兼容性
 
 **决策**：`api.Grant` 继续导出安全域类型，但安全域构造器保留旧公共 API 的参数形状：
@@ -194,19 +200,23 @@ authenticator 产出，不接受调用方以 `Scope` 自述身份，也不再有
 制造表面不可变、实际持有可变 list 的值对象，并把类型错误延迟到存储或授权判定路径。
 
 同样没有保留 `_to_control_grant` 做新旧值对象转换：该转换会静默丢弃 `grant_id` 与
-`revoked`，并迫使两套类型永久共存。过渡期只保留执行引擎 `PermissionManager`，值对象
-和 `routing_fields()` capability 已先收敛为单一真源；完整 `Authorizer` 调用链仍按本 PR
-“接口先行、实现暂缓”的边界留给实装 PR。
+`revoked`，并迫使两套类型永久共存。值对象和 `routing_fields()` capability 已先收敛为
+单一真源；完整 `Authorizer` 调用链已由实装 PR 交付（`StandardAuthorizer` /
+`SpaceAwareAuthorizer` 及具名 Grant/DelegationStore，旧 `PermissionManager` 退出生产
+判定路径）。
 
-**`legacy_request_context` 的移除点**：`jiuwen_memory/common/security/legacy.py` 及其全部调用点
-（`jiuwen_memory_entry/core/handler.py`——历史进程内调用方仍经它 dispatch，HTTP / CLI / MCP 已改走受控认证与 API 直调、
+**`legacy_request_context` 的移除点（已完成）**：`jiuwen_memory/common/security/legacy.py`
+及其全部调用点（HTTP / CLI / MCP 由 `api_contract.py` 直接调用同名 MemoryAPI，历史进程内调用经
+`jiuwen_memory_entry/core/handler.py` dispatch，
 `jiuwen_memory_adapter/jiuwenswarm/agent_memory_provider.py`、`evaluation/core/harness.py`、
-`examples/quickstart.py`、`tests/`）在 `dispatch` 收 `security=` 形参的 PR2 中删除。
-PR1 已把 `MemoryAPI` 公开签名接上 `security=`（`dispatch` 与各进程内调用方仍收
-`Scope`），故过渡桥必须留到历史进程内调用方全部迁移的那一刻。当前
-`Server.dispatch` 已接受可选 `security=`：受控进程内调用可直接传入认证结果；仅未传该参数的
-历史调用仍由 `legacy_request_context` 包装。PR2 将该参数收紧为必填并删除 payload actor
-兼容字段；网络入口在 PR1 已不会采信这些字段。
+`examples/quickstart.py`、`tests/`）已在 PR2 删除。PR1 曾把 `MemoryAPI` 公开签名接上
+`security=`（`dispatch` 与各进程内调用方仍收 `Scope`），过渡桥因此保留到历史进程内调用方
+全部迁移。PR2 已把 `dispatch.security` 收紧为必填并删除 payload actor 兼容字段（网络入口在
+PR1 已不采信这些字段）；进程内调用方一律经 `internal_context(authenticator)` /
+`new_request_context(auth, surface=Surface.INTERNAL)` 受控构造安全上下文——身份由认证器产出，
+调用方不能自述身份。适配器由 composition root 注入可信安全 provider（缺失即 fail-closed
+拒绝进程内路径）；示例与评测作为本地 composition root，显式用
+`new_request_context(AuthContext(...))` 构造开发上下文并标注开发模式。
 
 ## 6. PR3 固定的接口（审计完整性）
 
@@ -279,14 +289,12 @@ def verify_audit(
 ) -> AuditVerificationResult: ...
 ```
 
-- `verify_audit` 与既有 `audit` 是两个独立入口，不合并；本 PR 只为新入口使用
-  `VERIFY_AUDIT`，`audit` 继续按 legacy `READ` 对根 scope 判权，避免使存量精确匹配
-  `action='read'` 的授权记录失效。迁移到目标动作 `READ_AUDIT` 须另行评审并迁移授权数据；
+- `verify_audit` 与既有 `audit` 是两个独立入口，不合并；PR2 分别使用
+  `VERIFY_AUDIT` 与 `READ_AUDIT` 对根 scope 判权，普通 `READ` 授权不能替代审计授权；
   验证输入只允许服务端参数，不接受调用方传入 expected digest / key / proof / chain head；
 - provider 与专用 `audit_verify_guard` 成对注入；全量验证占该 `WorkloadGuard` 的一个
-  独立并发槽，耗尽抛 `RateLimitedError`。本期不注册 `verify_audit` HTTP verb，也不修改
-  generic handler 的既有错误映射（`RateLimitedError` 仍按默认路径返回 400，与 FAQ 一致）；
-  未来随真实认证接入改为 HTTP 429 时，应作为影响既有接口的独立兼容性变更评审；
+  独立并发槽，耗尽抛 `RateLimitedError`；HTTP 将容量限流映射为 429，legacy handler
+  不承载该入口，既有其他方法的限流错误仍走其历史 400 映射；
 - guard 准入后、调用 provider 前先写入 `verify_audit` 审计事件；provider 因链篡改、
   schema 损坏等抛 `AuditIntegrityError` 时异常原样传播，但发起者与发生时间已经留痕。
   guard 耗尽时调用仍抛 `RateLimitedError`，但事件的 `decision` 保持 `allow`（授权已通过），
@@ -301,11 +309,10 @@ def verify_audit(
   `truncated=true`，避免自定义 provider 放大返回体；
 - `truncated` 只表示错误样本列表被有效 `max_samples` 截短，扫描未完成用
   `status=incomplete`，不能复用同一标志掩盖缺页；
-- 真实认证接入前，`jiuwen_memory_entry/core/handler.py` **不注册** `verify_audit`：legacy handler
-  只能从 payload 构造普通 actor，无法构造可信根管理上下文，注册后默认装配必然 403，且
-  不能用 payload 自述 root 修补。当前只有形态无关的 `MemoryAPI` 一等入口；HTTP、MCP、CLI
-  都暂不提供该管理面的一等入口。认证中间件接入后，HTTP 可直接使用下列
-  `AuditVerificationResult.to_body()` 纯 dict；MCP tool 与 CLI command 仍需另行设计：
+- HTTP `/v1/verify_audit`、CLI `verify_audit` 与 MCP `memory_verify_audit` 已经由真实认证
+  中间件和共享 API 契约暴露该入口。legacy handler 没有同名入口，且其既有方法也必须
+  显式传入可信上下文，不得从 payload 自述 actor。返回体保持下列冻结结构；未装配
+  provider 时返回 `unsupported`，入口可调用不代表 PR3 完整性实现已启用：
 
 ```json
 {
@@ -333,9 +340,9 @@ Body 是**对外线上契约**：字段名、类型与样本 Proof 字段一经�
 
 | 项 | 目标形态 | 当前过渡行为 |
 |---|---|---|
-| 鉴权动作 | `verify_audit` 使用安全域 `Action.VERIFY_AUDIT`；既有 `audit` 的目标动作是 `READ_AUDIT` | `verify_audit` 直接按 `VERIFY_AUDIT` 对根 scope 判权；`audit` 为兼容存量精确匹配 `action='read'` 的授权记录，仍使用 legacy `READ`，本 PR 不做授权数据迁移 |
+| 鉴权动作 | `verify_audit` 使用 `Action.VERIFY_AUDIT`；`audit` 使用 `READ_AUDIT` | PR2 已按目标动作独立判权，普通 READ 不互认 |
 | 未装配 provider | —— | `verify_audit` 诚实返回 `unsupported`（`detail="audit integrity provider not configured"`），不抛错、不降级成 clean |
 | `audit_integrity` 配置段 | `chained_hmac` 实现注册 | 无注册 target，配置该段装配失败（fail-closed，不静默降级为普通审计） |
 | `ProtectedAuditLogger` | PEP 与 surface 记录入口都经它 | 无调用点（需要 provider 实例），仅固定接口 |
 | `KeyProvider.mac` | `LocalKeyProvider` 支持 | 默认 `NotImplementedError`（所有 provider） |
-| Surface 暴露 | 认证中间件产出可信根管理上下文后由 HTTP 暴露；MCP/CLI 另设一等入口 | HTTP generic dispatch、MCP tool、CLI command 均不注册；进程内调用须显式传 `RequestSecurityContext` |
+| Surface 暴露 | 认证中间件产出可信上下文后由 HTTP / MCP / CLI 暴露 | 三种形态均经共享 API 契约调用；进程内调用须显式传 `RequestSecurityContext`，legacy handler 不注册该方法 |

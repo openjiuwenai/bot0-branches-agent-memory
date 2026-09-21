@@ -1,7 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """Generic handler 的既有错误映射回归测试。"""
 
-from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -16,15 +15,24 @@ from jiuwen_memory.api import (
     build_dev_authenticator,
 )
 from jiuwen_memory.common.errors import (
+    BackendError,
     PartialFailureError,
     RateLimitedError,
     UnsupportedCapabilityError,
 )
+from jiuwen_memory.common.security import internal_context
 from jiuwen_memory_entry.core import handler
 from jiuwen_memory_entry.core.auth_middleware import authenticated
 from jiuwen_memory_entry.core.legacy_request_adapter import build_legacy_dispatch_request
+from tests.support.scoped_authenticator import ScopedAuthenticator
 
 pytestmark = pytest.mark.unit
+
+
+def _dispatch_request(verb: str, payload: dict):
+    """布置一次 dispatch：actor 来自 security（测试辅助构造），payload 只作 target。"""
+    security = internal_context(ScopedAuthenticator(handler.Scope(org="local", user="developer")))
+    return build_legacy_dispatch_request(verb, payload, security=security)
 
 
 def test_rate_limited_error_preserves_legacy_400_mapping() -> None:
@@ -38,7 +46,7 @@ def test_rate_limited_error_preserves_legacy_400_mapping() -> None:
 
     srv = SimpleNamespace(api=_Api())
 
-    status, body = handler.dispatch(srv, build_legacy_dispatch_request("audit", {}))
+    status, body = handler.dispatch(srv, _dispatch_request("audit", {}))
 
     assert status == 400
     assert body == {"error": "RateLimitedError", "message": "rate limit exceeded"}
@@ -60,7 +68,7 @@ def test_partial_failure_error_returns_retry_fields() -> None:
 
     status, body = handler.dispatch(
         srv,
-        build_legacy_dispatch_request(
+        _dispatch_request(
             "delete_space",
             {"tenant_id": "acme", "space": "lab"},
         ),
@@ -87,7 +95,7 @@ def test_unsupported_capability_error_maps_to_400() -> None:
 
     status, body = handler.dispatch(
         srv,
-        build_legacy_dispatch_request(
+        _dispatch_request(
             "add",
             {
                 "tenant_id": "org-1",
@@ -103,18 +111,17 @@ def test_unsupported_capability_error_maps_to_400() -> None:
     assert "modality 'image'" in body["message"]
 
 
-@pytest.fixture
-def authenticated_request():
+@pytest.fixture(name="authenticated_request")
+def _authenticated_request():
     """参数透传回归始终携带真实认证边界产出的上下文。"""
     with authenticated(
         build_dev_authenticator(), Credentials(), surface=Surface.INTERNAL
     ) as security:
 
         def build(verb, payload):
-            request = build_legacy_dispatch_request(
-                verb, {"tenant_id": "acme", "scope": "alice", **payload}
+            return build_legacy_dispatch_request(
+                verb, {"tenant_id": "acme", "scope": "alice", **payload}, security=security
             )
-            return replace(request, actor=security.actor, security=security)
 
         yield build
 
@@ -194,3 +201,21 @@ def test_invalid_upstream_parameters_fail_before_api_call(
 
     assert status == 400
     assert body["error"] == "ValidationError"
+
+
+def test_backend_error_maps_to_503_not_400_or_500() -> None:
+    """授权依赖故障是服务端依赖不可用，不是调用方参数错误。"""
+
+    class _Api:
+        @staticmethod
+        def search(_query, _ctx, *, security, **_kwargs):
+            del security
+            raise BackendError("store down")
+
+    srv = SimpleNamespace(api=_Api())
+    request = _dispatch_request("search", {"query": "x"})
+
+    status, body = handler.dispatch(srv, request)
+
+    assert status == 503
+    assert body == {"error": "BackendError", "message": "store down"}
