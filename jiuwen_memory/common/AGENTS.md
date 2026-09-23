@@ -7,6 +7,10 @@
 
 全局共享的可插拔插件与核心数据类型。提供工厂注册基础设施，定义跨层数据结构，是各层消费的共享依赖。
 
+PR3 已于 2026-10-08 迁移到当前 PR2；当前基线验证及门禁后续复核见
+[F15 当前 PR2 基线适配](../../docs/features/common/F15-pr3-current-pr2-integration.md)。
+旧验收结果是原基线的历史记录，不替代本轮回归。
+
 ## 模块地图
 
 | 文件/目录 | 职责 |
@@ -33,8 +37,8 @@
 | `feature_extractor/` | FeatureExtractor 插件目录 |
 | `llm/` | LLM 插件目录（`echo` / `openai` / `dashscope`） |
 | `reranker/` | Reranker 插件目录 |
-| `audit/` | AuditLogger 插件目录；`protected_audit_logger.py` 的 `ProtectedAuditLogger` 把 record 委派审计完整性 provider、query 透传，并在构造时校验 provider chain store 与 logger 是同一对象（PR3 契约，接口先行，PR1 无调用点） |
-| `security/` | 安全能力的唯一归属地（F05）。PR1 已实装认证、保护与静态加密；`authentication/` 提供 Authenticator、PrincipalKeyStore 与 CredentialStatusRegistry，唯一实现目录是其内部的 `authentication/authentication_impl/`，包含 api_key / dev / trusted 三种认证器及凭据存储实现。进程内调用方经 `request_context.internal_context(authenticator)` 显式穿过认证边界，身份由传入的认证器产出、调用方不能自述身份（legacy 桥与公共 `ScopedAuthenticator` 均已删除，测试替身在 `tests/support/`）。PR2 在 `authorization/authorization_impl/` 提供 Standard/Routing/SpaceAware Authorizer 及 memory/SQLite GrantStore、DelegationStore；冻结约束是 MemoryAPI/Authorizer 唯一 PEP/PDP、凭据逐请求在线复核且旧 PermissionManager 不进入生产路径。`audit_integrity/` 仍只有 PR3 固定接口，未实装或激活。`request_context.py` 提供受控上下文构造。安全注册入口统一使用 `import_required` 记录并重抛依赖导入错误。另含空间级授权事实与谓词纯函数（见 `docs/features/control/F07-collective-memory-design.md`）。 |
+| `audit/` | AuditLogger 插件目录；内存 / SQLite 后端实现 ChainedAuditStore；`protected_audit_logger.py` 的 `ProtectedAuditLogger` 把 record 委派审计完整性 provider、query 透传，并在构造时校验 provider chain store 与 logger 是同一对象；PR3 已由内核装配调用；受保护写路径统一失败语义、degraded 闩供显式 mutation 预检、detail 写入过滤在写入边界执行（总轮换预算与字段豁免问题已修复；非秘密标识仅精确允许 credential_id/key_fp） |
+| `security/` | 安全能力的唯一归属地（F05）。PR1 已实装认证、保护与静态加密；`authentication/` 提供 Authenticator、PrincipalKeyStore 与 CredentialStatusRegistry，唯一实现目录是其内部的 `authentication/authentication_impl/`，包含 api_key / dev / trusted 三种认证器及凭据存储实现。进程内调用方经 `request_context.internal_context(authenticator)` 显式穿过认证边界，身份由传入的认证器产出、调用方不能自述身份（legacy 桥与公共 `ScopedAuthenticator` 均已删除，测试替身在 `tests/support/`）。PR2 在 `authorization/authorization_impl/` 提供 Standard/Routing/SpaceAware Authorizer 及 memory/SQLite GrantStore、DelegationStore；冻结约束是 MemoryAPI/Authorizer 唯一 PEP/PDP、凭据逐请求在线复核且旧 PermissionManager 不进入生产路径。`audit_integrity/` 已注册 chained_hmac，实现版本化 HMAC、增量验证与内存 / SQLite 链式后端；2026-09-23 第七轮实现复验通过，累计 52 项独立样本全部通过，补充样本已归档到正式 tests/，代码、测试和文档统一交付，记录见 `security-plans/archived/06-pr3-audit-integrity/reports/2026-09-23-pr3-seventh-acceptance.md`。`request_context.py` 提供受控上下文构造。安全注册入口统一使用 `import_required` 记录并重抛依赖导入错误。另含空间级授权事实与谓词纯函数（见 `docs/features/control/F07-collective-memory-design.md`）。 |
 | `lock/` | LockProvider 横切接口目录：跨实例互斥原语（接口 + `redis` / `memory` 实现）。**common 层唯一的异步契约**，只交付原语、不在业务路径加锁，见 [F06-distributed-lock.md](../../docs/features/common/F06-distributed-lock.md) |
 | `security/_delegation_binding.py` | 私有服务端装配适配：凭据指纹绑定现有委托 ID，认证 actor 不变，记录与 Authorizer 必须同源；供 PEP/PDP 共用绑定复核，不注册新认证 target、不扩展冻结接口。 |
 
@@ -82,7 +86,7 @@
 - 核心数据类型（MemoryUnit/Scope/Context/Relation/Chunk/AuditEvent 等）
 - 工厂注册基础设施（Factory 基类 + `TOP_NAME` 命名空间 + `build`/`build_named`/`dep` 三接口）
 - 横切接口（Authenticator / PrincipalKeyStore / RateLimiter / WorkloadGuard / BindingPolicy / CryptographyProvider / KeyProvider / AuditLogger / LockProvider）
-- 安全域契约（认证/密码学/保护与 PR2 授权已实装；PR3 审计完整性仅固定接口）
+- 安全域契约（认证/密码学/保护与 PR2 授权已实装；PR3 链式 HMAC 已实现，第七轮实现复验通过，累计 52 项独立样本通过）
 - 错误类型
 - 工具函数
 

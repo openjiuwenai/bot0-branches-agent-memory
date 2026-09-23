@@ -31,7 +31,7 @@
 > S03 / S06 / S07 / S10 为准，当前实现地图以各 `jiuwen_memory/*/AGENTS.md` 为准。本文与代码冲突时
 > 不得据此反向修改代码，应先按上述 spec 核对并更新本文的状态注记。
 
-当前落地状态（2026-08-07）：全部安全能力归 `jiuwen_memory/common/security/`，按能力域分子包：
+历史 PR1 落地快照（2026-08-07，不代表当前 PR2 / PR3 状态）：全部安全能力归 `jiuwen_memory/common/security/`，按能力域分子包：
 
 - `authentication/`：`Authenticator`、`PrincipalKeyStore`、`CredentialStatusRegistry`，内置 dev / api_key / trusted 与 memory 凭据存储。Registry 接缝和单测已落地，但 PR1 尚无 PEP 消费它。
 - `cryptography/`：`CryptographyProvider` 与独立 `KeyProvider`；内置 `local` ENC1 AES-GCM 实现。

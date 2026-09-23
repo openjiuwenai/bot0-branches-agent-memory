@@ -567,6 +567,8 @@ class QueryOpsMixin:
             context=permission_context,
         )
         self._ensure_space_writable(scope)
+        # mutation 前审计完整性预检与故障隔离（R3，计划 §9.3）。
+        self._ensure_audit_integrity_healthy()
         before = asyncio.run(self._queries.get(unit_id, scope, None))
         plan = None
         if self._commands.requires_update_preparation(before, patch):
@@ -651,6 +653,8 @@ class QueryOpsMixin:
                     context=permission_context,
                 )
                 auth.update(unit_auth)
+        # mutation 前审计完整性预检与故障隔离（R3，计划 §9.3）。
+        self._ensure_audit_integrity_healthy()
         deleted = asyncio.run(self._commands.delete(selector))
         self._log(
             identity,
@@ -677,6 +681,9 @@ class QueryOpsMixin:
             space_action=_evolve_space_action(mode),
         )
         self._ensure_space_writable(scope)
+        # mutation 前审计完整性预检与故障隔离（R3，计划 §9.3）：evolve 触发的演进任务
+        # 会改写记忆，按 mutation 对待。
+        self._ensure_audit_integrity_healthy()
         job_id = asyncio.run(self._commands.evolve(scope, mode, channel))
         self._log(identity, "evolve", target_scope=scope, detail={**auth, "job_id": job_id})
         return job_id

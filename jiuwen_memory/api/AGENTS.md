@@ -8,6 +8,10 @@
 
 统一对外 Core API，所有接入形态（SDK/CLI/MCP/HTTP）最终映射到 `MemoryAPI`。本层是控制层的薄封装：做参数装配与鉴权，编排逻辑全部在 `jiuwen_memory/control`。
 
+PR3 当前 PR2 基线适配保留 `get(as_of)` 的最终返回快照判权和完整 MCP 参数；本轮验证
+范围见 [F15](../../docs/features/common/F15-pr3-current-pr2-integration.md)，不沿用旧基线的
+通过结论。
+
 ## 模块地图
 
 | 文件 | 职责 |
@@ -116,8 +120,8 @@ MemoryAPI.method(scope=target, security=RequestSecurityContext)
    只兼容再导出同一对象，不得定义第二套类型或结构转换。`grant_id` 由服务端生成，`revoke`
    按 ID 精确、幂等、单调撤销；管理入口与实际 Authorizer 判定必须使用同一具名 GrantStore，
    不得双写旧 `PermissionManager`。
-3. 所有数据面方法（add/batch_add/search/list/get/update/delete/evolve）都需要鉴权，治理面（inspect/trace/audit）也需要鉴权。`LocalMemoryAPI._record_audit()` 在存在受控请求上下文时以 `setdefault` 写入 `AuditEvent.detail["request_id"]`，用于与入口响应和日志关联，不覆盖调用方已经传入的可信 detail 值。
-4. `verify_audit`（审计完整性验证，PR3 接口先行）是独立于 `audit` 的管理面入口：新入口按 `VERIFY_AUDIT` 对根 scope 判权；既有 `audit` 亦按目标动作 `READ_AUDIT` 鉴权（授权记录按 action 精确匹配，不与普通 READ 互认）。验证只收服务端参数（不接受调用方传入 digest/key/proof）；provider 与专用 `audit_verify_guard` 必须成对注入，全量验证占一个独立并发槽，耗尽抛 `RateLimitedError`。guard 耗尽发生在授权通过后，审计事件保持 `decision=allow`，并沿用 `workload_guard=exhausted` 表达容量准入失败，不得混入 `decision=deny` 的鉴权拒绝事件。guard 准入后先落验证尝试审计、再调用 provider，provider 抛完整性异常时仍须能追溯发起者与发生时间；成功或异常路径不重复写完成事件。`page_size` / `max_samples` 截到服务端 `globals.audit_verify_max_page_size` / `globals.audit_verify_max_samples` 装配出的可信 `AuditVerificationLimits`；装配边界只接受真正的整数（拒绝 `bool` 和字符串），并把非法类型或范围统一翻译成 `ValidationError`。provider 返回 samples 由 PEP 再截到有效上限。未装配 provider 时返回 `unsupported`，不降级成 clean。HTTP 在认证中间件产出可信上下文后通过同名 `/v1/verify_audit` 暴露原返回值，容量限流映射为 429；CLI 通过同名 `verify_audit` 命令和同一 JSON 契约暴露；MCP 经 `memory_verify_audit` 工具暴露同一契约（`after_sequence`/`page_size`/`max_samples`/`anchor_policy` 透传）；legacy handler 暂无一等入口。进程内调用必须显式传安全上下文。
+3. 所有数据面方法（add/batch_add/search/list/get/update/delete/evolve）都需要鉴权，治理面（inspect/trace/audit）也需要鉴权。`LocalMemoryAPI._record_audit()` 先剥除 detail 中的 `decision` / `request_id`，再由服务端写入真实判定和受控请求 ID，用于与入口响应和日志关联；系统键不计入 wrapper 的 64 键预算，始终保留（T5 已修复）。
+4. `verify_audit`（审计完整性验证，PR3 已实现，第七轮实现复验通过，累计 52 项独立样本通过）是独立于 `audit` 的管理面入口：新入口按 `VERIFY_AUDIT` 对根 scope 判权；既有 `audit` 亦按目标动作 `READ_AUDIT` 鉴权（授权记录按 action 精确匹配，不与普通 READ 互认）。验证只收服务端参数（不接受调用方传入 digest/key/proof）；provider 与专用 `audit_verify_guard` 必须成对注入，全量验证占一个独立并发槽，耗尽抛 `RateLimitedError`。guard 耗尽发生在授权通过后，审计事件保持 `decision=allow`，并沿用 `workload_guard=exhausted` 表达容量准入失败，不得混入 `decision=deny` 的鉴权拒绝事件。guard 准入后先落验证尝试审计、再调用 provider，provider 抛完整性异常时仍须能追溯发起者与发生时间；成功或异常路径不重复写完成事件。`page_size` / `max_samples` 截到服务端 `globals.audit_verify_max_page_size` / `globals.audit_verify_max_samples` 装配出的可信 `AuditVerificationLimits`；装配边界只接受真正的整数（拒绝 `bool` 和字符串），并把非法类型或范围统一翻译成 `ValidationError`。provider 返回 samples 由 PEP 再截到有效上限。未装配 provider 时返回 `unsupported`，不降级成 clean。HTTP 在认证中间件产出可信上下文后通过同名 `/v1/verify_audit` 暴露原返回值，容量限流映射为 429；CLI 通过同名 `verify_audit` 命令和同一 JSON 契约暴露；legacy handler 不注册该 verb；MCP 已有 `memory_verify_audit` 工具，经 `invoke_api` 调用，透传 after_sequence/page_size/max_samples/anchor_policy 验证参数。进程内调用必须显式传安全上下文。
 5. 装配由 `assembly.assemble` / `assembly.assemble_runtime` 完成，内部经 `_build_kernel`
    与各 Producer 的 `dep/build_named/build` 组装；Retriever 的 `domain_store()` 与内部
    `_Kernel.storage` 引用同一个全局 manager（`globals.store_manager` 指名，默认

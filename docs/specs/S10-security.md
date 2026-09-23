@@ -6,7 +6,7 @@
 |---|---|
 | 关联模块 | `jiuwen_memory/common/security/`、`jiuwen_memory_entry/`、`jiuwen_memory/api/`、`jiuwen_memory/storage/` |
 | 最近一次修订日期 | 2026-10-08 |
-| 关联特性文档 | `docs/features/common/F04-security-interfaces-and-encryption.md`，`docs/features/common/F10-authentication-kernel.md`，`docs/features/common/F11-authorization-and-isolation.md`，`docs/features/common/F12-pr2-upstream-integration.md`，`docs/features/common/F13-pr2-independent-acceptance-closure.md` |
+| 关联特性文档 | `docs/features/common/F04-security-interfaces-and-encryption.md`，`docs/features/common/F05-security-api-contracts.md`，`docs/features/common/F10-authentication-kernel.md`，`docs/features/common/F11-authorization-and-isolation.md`，`docs/features/common/F12-pr2-upstream-integration.md`，`docs/features/common/F13-pr2-independent-acceptance-closure.md` |
 
 ## 范围 / 边界
 
@@ -14,8 +14,12 @@
 授权判定与安全运行期装配不变量。PR1 已交付认证和加密；PR2 的最新集成与验证边界见
 F12-pr2-upstream-integration；其后独立验收发现的边界修复见 F13，不能用旧版验收结果替代本次验证。
 最新 PR1 基线适配与版本快照鉴权收口见 F14-pr2-current-pr1-integration。
+PR3 当前 PR2 基线适配及本轮验证范围见 F15-pr3-current-pr2-integration；旧验收数据不替代
+本轮回归结果。完整 MCP 参数继承当前 PR2，审计完整性适配不得回退返回快照鉴权。
 本页的 PR2 条款是已经冻结的目标契约。
-审计完整性实现仍归 PR3。
+PR3 审计完整性（链式 HMAC 证明）已有实现；第七轮实现复验通过，累计 52 项独立样本全部通过（2026-09-23）；MCP 实际传输与外部部署验证仍有边界。缺陷与修复见
+[验收记录](../../security-plans/archived/06-pr3-audit-integrity/reports/2026-09-23-pr3-seventh-acceptance.md)。
+以下契约保持不变，不因实现缺陷而放宽。
 
 安全能力统一归属 `jiuwen_memory/common/security/`，按能力域分子包：
 
@@ -31,7 +35,9 @@ F12-pr2-upstream-integration；其后独立验收发现的边界修复见 F13，
 `authorization/` 的契约随接口分支固定，PR2 提供 `StandardAuthorizer`、
 `RoutingAuthorizer`、`SpaceAwareAuthorizer`、memory / SQLite Store 与 PEP 接线，当前实现已
 完成核心接线；SDK 凭据源与受控代理代写的收口决策见 F12。
-`audit_integrity/`（PR3）本期仍只有固定契约，不实装或激活其 `*_impl`。
+`audit_integrity/`（PR3）提供 `chained_hmac` 的 `AuditIntegrityProvider`、内存 / SQLite 审计
+后端叠加的 `ChainedAuditStore` 与 `ProtectedAuditLogger` 接线（契约见 F05 §6；外部
+`AuditAnchor` 无产品实现，`anchor_policy=required` 无锚点即拒绝）。
 
 > 历史状态：这些能力此前平铺在 `common/authentication/`、`credential_store/`、
 > `admission/`、`encryption/` 与 `type_def/auth.py`。那是迁移前的目录形态，不再作为
@@ -179,7 +185,7 @@ import，注册装饰器才会生效。当前核心不自动发现任意外部 P
 
 顶层段名：`security`、`authenticator`、`key_store`、`authorizer`、`grant_store`、
 `delegation_store`、`rate_limiter`、`workload_guard`、`binding_policy`、`cryptography`、
-`key_provider`。
+`key_provider`、`audit_integrity`。
 
 ```yaml
 security:
@@ -192,6 +198,7 @@ security:
       workload_guard: shared_budget   # 具名引用 = 跨 surface 共享同一份预算
       binding_policy: loopback        # 省略时按 target 名取默认实现
       cryptography: default           # 可选；不配则 SecurityRuntime 不持有密码学能力
+      audit_integrity: default        # 可选；不配则普通审计（无链式证明）
 authenticator:
   default:
     target: api_key

@@ -16,7 +16,7 @@ jiuwen_memory/
 ├── control/        # 编排层：MemoryEngine + application ports + Scheduler/Permission/Policy/Governance/Space
 ├── ingest/         # 接入层：多模态 → 文本投影 + MemoryUnit，不落盘
 ├── retrieval/      # 检索层：scope 过滤 → 多路召回 → 融合重排 → 渐进式披露
-└── storage/        # 存储层：StoreManager 管理面 + DomainStore 数据面 + 六类 Store，scope 原生隔离
+└── storage/        # 存储层：StoreManager 管理面 + DomainStore 数据面 + 七类 Store，隔离在存储层落实
 ```
 
 ## 数据流
@@ -29,7 +29,7 @@ jiuwen_memory/
   control/MemoryEngine ─── 跨层编排中枢
        │
        ├─ write ──→ ingest/Ingestor（规约）→ construction/（落盘 + 索引）→ storage/*Store
-       ├─ recall ─→ retrieval/Retriever → storage/Storage → storage/*Store.search
+       ├─ recall ─→ retrieval/Retriever → storage/DomainStore → storage/*Store.search
        ├─ evolve ─→ control/Scheduler → construction/Evolver → storage/*Store
        └─ get/update/delete ──→ storage/*Store（点读 + 非破坏式修正）
 ```
@@ -50,7 +50,8 @@ jiuwen_memory/
 
 ### retrieval/ — 检索层
 
-五步检索链路：`QueryParser`（查询理解）→ `Recaller`（多路召回）→ `Fuser`（融合+重排）→ `Discloser`（渐进式披露 L0→L1→L2）→ `Retriever`（编排+轨迹）。
+`Retriever` 编排查询理解、系统谓词、数据面召回、融合、真源复核、可选重排和渐进披露；
+`QueryParser`、`Fuser`、`Discloser` 是其构件，多路 `Recaller` 归存储数据面内部。
 
 ### control/ — 编排层
 
@@ -60,9 +61,11 @@ jiuwen_memory/
 
 存储层分管理面 `StoreManager`（能力发现、命名端口、统一授权代理）与数据面 `DomainStore`
 （MemoryUnit 领域操作与检索适配）两个 ABC，默认 `CompositeStoreManager` +
-`CompositeDomainStore` 组合六类 Store；全局唯一 manager 由 `globals.store_manager` 指名
-（F07）。底层 Store 统一 CRUD 动词（insert/delete/update/get），检索型 Store 额外提供
-`search`。scope 隔离是存储层原生职责。
+`CompositeDomainStore` 经 manager 使用后端端口；manager 纳管 KV、全文、向量、图、融合、
+文件和实体七类 Store，全局唯一 manager 由 `globals.store_manager` 指名（F07）。
+通用 Store 统一 CRUD 动词（insert/delete/update/get），检索型 Store 额外提供 `search`。
+实体 Store 使用独立的实体操作契约；各后端按其契约承担隔离，其中实体后端以 space routing
+与 actor 过滤表达隔离，不套用完整 Scope 五维。
 
 ### common/ — 共享插件 + 类型
 
@@ -140,7 +143,7 @@ jiuwen_memory/
 （本目录内部需要遵守的约束与不变量；跨模块的规则落到 docs/specs/，不写在这里）
 ```
 
-**更新规则**：以下三种情况必须在同一次实现 PR 的合并提交里更新此文件：
+**更新规则**：以下三种情况必须在该实现 PR 的合并提交里同步更新此文件：
 - 目录内文件增删改名
 - 公开入口（类/函数）增删改名
 - 文件间调用关系发生变化

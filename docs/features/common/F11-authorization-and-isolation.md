@@ -27,7 +27,7 @@ PR1 已同步到最新上游，PR2 的旧实现建立在被重写过的旧目录
 3. `GrantStore` / `DelegationStore` 是授权真源；服务端生成 `grant_id`，撤销按 ID 幂等且单调。
    认证产生的 `RequestSecurityContext` 必须在读取业务事实或产生副作用前完成来源、时效和凭据复核。
 4. 集成分支在关闭全部复审阻断项后方可合入；最终关闭证据归档在
-   `security-plans/problems/2026-09-08-sec-isolation-final-acceptance.md`。
+   `security-plans/archived/05-pr2-authorization/reports/2026-09-08-sec-isolation-final-acceptance.md`。
 
 ## 拒绝的方案
 
@@ -57,7 +57,7 @@ PR1 已同步到最新上游，PR2 的旧实现建立在被重写过的旧目录
 ## 已知遗留
 
 本节曾宣称四项阻断项「全部整改完成」且「无新增已知遗留」，而
-`security-plans/problems/2026-09-08-sec-isolation-reacceptance.md` 的复验结论是**不通过**，
+`security-plans/archived/05-pr2-authorization/reports/2026-09-08-sec-isolation-reacceptance.md` 的复验结论是**不通过**，
 其中「Registry 与 Authenticator 同源装配」「legacy 身份自述退场」两项被判为未修复。该矛盾
 由本轮整改关闭，下列每项均给出可核查的判据位置，不再以「已完成」作结论：
 

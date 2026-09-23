@@ -28,6 +28,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from jiuwen_memory.common._support import as_bool
 from jiuwen_memory.common.audit.base import AuditLogger, AuditProducer
+from jiuwen_memory.common.audit.protected_audit_logger import ProtectedAuditLogger
 from jiuwen_memory.common.bootstrap import register_plugins
 from jiuwen_memory.common.errors import ValidationError
 from jiuwen_memory.common.factory.factory import Factory
@@ -37,12 +38,17 @@ from jiuwen_memory.common.security.audit_integrity.base import (
     DEFAULT_AUDIT_VERIFY_PAGE_SIZE,
     AuditVerificationLimits,
 )
+from jiuwen_memory.common.security.audit_integrity.chain_store import ChainedAuditStore
 from jiuwen_memory.common.security.authentication.credential_registry import (
     CredentialStatusRegistry,
 )
 from jiuwen_memory.common.security.authorization.base import (
     AuthorizationProducer,
     Authorizer,
+)
+from jiuwen_memory.common.security.protection.workload_guard import (
+    WorkloadGuard,
+    WorkloadGuardProducer,
 )
 from jiuwen_memory.common.security.runtime import SecurityRuntime
 from jiuwen_memory.config import Config
@@ -109,7 +115,8 @@ class _Kernel:
         storage: 上层统一使用的 StoreManager（默认 CompositeStoreManager；数据面
             领域操作经 ``storage.domain_store()``；配置段名 ``store_manager:``）
         space: SpaceManager（若装配）
-        audit: 装配好的审计器；供 surface 记录发生在 API 外的认证事件
+        audit: 装配好的审计器；供 surface 记录发生在 API 外的认证事件。启用审计
+            完整性时是 :class:`ProtectedAuditLogger`（入口事件与 API 业务事件同链）
         config_source: 运行时晚绑定配置来源（默认 YamlDefaultsConfigSource）
     """
 
@@ -201,6 +208,23 @@ def _audit_verify_limits(root: ComponentConfig) -> AuditVerificationLimits:
         raise ValidationError(f"invalid audit verification limits: {exc}") from None
 
 
+def _audit_verify_guard(ctx: AssemblyContext) -> WorkloadGuard:
+    """verify_audit 的专用 WorkloadGuard 预算（F05 §Protection §WorkloadGuard）。
+
+    引用名经 ``security.<name>.params.audit_verify_guard`` 指向 workload_guard 命名
+    空间下的具名实例；未配置时匿名新建 semaphore（与 Runtime 其余 guard 的保守默认
+    一致）。不与请求路径的 security_budget 共享预算——审计全量验证是重操作，与认证
+    风暴互挤槽位会让一边饿死另一边（F05 §WorkloadGuard：审计验证必须使用专用实例）。
+    """
+    names = sorted(ctx.namespaces.get("security", {}))
+    if not names:
+        return WorkloadGuardProducer.build("semaphore", {}, ctx)
+    name = "default" if "default" in names else names[0]
+    spec = ctx.namespaces["security"][name]
+    config = ComponentConfig(params=dict(spec.params), ctx=ctx, target=spec.target, name=name)
+    return WorkloadGuardProducer.dep(config, "audit_verify_guard", default="semaphore")
+
+
 def _build_kernel(
     policies: dict[str, str] | None = None,
     kv: KVStore | None = None,
@@ -215,12 +239,6 @@ def _build_kernel(
     - ``kv``：显式注入真源后端，覆盖配置的 kv_store 选择（如传 ``SQLiteKVStore`` 即落盘）。
     """
     config = _coerce_config(config)
-    if config is not None and not config.is_empty():
-        requested = config.context()
-        if "audit_integrity" in requested.namespaces:
-            raise ValidationError(
-                "audit_integrity is interface-only: no implementation target is registered"
-            )
     _register_all()
     Factory.reset_all()  # 每次组装前清空具名实例缓存以隔离多次装配
 
@@ -329,6 +347,43 @@ def _build_kernel(
             raise ValidationError("security Runtime 与内核 PEP 的 authorizer 必须是同一实例")
         # 同包装配接缝；不为初始化凭据真源扩充冻结的 MemoryAPI。
         api._bind_credential_sources(security_runtime.authenticator)  # pylint: disable=protected-access
+
+    # 审计完整性接线（计划 §8.2 阶段 C）：仅当显式配置并经 security 段引用时启用。
+    # Runtime 在 API 之后装配（其 authorizer 复用内核具名实例），故这里经内部接缝把
+    # 已按普通审计装配的 API 切换到受保护审计：provider 先做对象 identity 校验，
+    # ProtectedAuditLogger 包装后注入 PEP 与 Kernel.audit（surface 入口事件同链）。
+    audit_integrity_provider = (
+        security_runtime.audit_integrity_provider if security_runtime is not None else None
+    )
+    # 以实际 provider 为准接线（PR3-06）：security.params.audit_integrity 支持 Factory
+    # 内联组件写法，此时顶层具名段不存在但 provider 已构建；只看顶层段会把这类配置
+    # 静默降级回普通审计。仍保留 fail-closed：配了顶层段却没有 Runtime 引用时拒绝启动。
+    if audit_integrity_provider is not None:
+        if not isinstance(audit_logger, ChainedAuditStore):
+            raise ValidationError(
+                "audit_integrity 要求 audit 后端同时实现 ChainedAuditStore；"
+                f"得到 {type(audit_logger).__name__}"
+            )
+        # §8.2 不变量 3：provider 的 store 与 audit_logger 必须是同一具名实例。
+        # chained_hmac._build 经 AuditProducer.dep(config, "audit") 取具名 audit 实例，
+        # Factory 类级缓存保证命中同一对象——这里用对象 identity 复核，不靠配置假定。
+        if audit_integrity_provider.chain_store() is not audit_logger:
+            raise ValidationError(
+                "audit integrity provider 与 AuditLogger 必须使用同一具名后端实例"
+                "（audit_integrity.params.audit 应引用 audit 命名空间下的同一实例名）"
+            )
+        audit_logger = ProtectedAuditLogger(audit_integrity_provider, audit_logger)
+        api._install_audit_integrity(  # pylint: disable=protected-access
+            audit_logger,
+            audit_integrity_provider,
+            _audit_verify_guard(ctx),
+        )
+    elif "audit_integrity" in (ctx.namespaces or {}):
+        raise ValidationError(
+            "配置了 audit_integrity 段，但没有 SecurityRuntime 引用它。审计完整性"
+            "必须经 security 段的 params.audit_integrity 显式启用（不配该段 = 普通审计）；"
+            "只配 audit_integrity 而不接线，部署会以为已启用链式证明，实际仍是普通审计。"
+        )
     return _Kernel(
         api=api,
         kv=kv_store,

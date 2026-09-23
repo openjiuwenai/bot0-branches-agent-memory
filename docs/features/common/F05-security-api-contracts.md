@@ -6,8 +6,8 @@
 |---|---|
 | 日期 | 2026-09-07 |
 | 影响范围 | `jiuwen_memory/common/security/`、`jiuwen_memory/common/audit/`、`jiuwen_memory/api/`、`jiuwen_memory_entry/core/`、`jiuwen_memory_entry/mcp_server/transport_security.py`、`docs/specs/S02-memory-api.md`、`docs/specs/S07-common.md` |
-| 关联文档 | [S02 记忆接口层](../../specs/S02-memory-api.md)、[S07 公共组件层](../../specs/S07-common.md)、[F05 公共安全架构](../../../security-plans/F05-common-security-architecture.md)、[PR1/PR2 接口说明文档](../../../security-plans/2026-08-17-PR1-PR2-接口说明文档.md)、[F04 安全接口与加密设计](F04-security-interfaces-and-encryption.md) |
-| 状态 | PR1 已同步 2026-09-20 上游；PR2 合入该基线并关闭 SDK 凭据装配、具名角色与代理代写缺口，验证范围见 F12；PR3 未实装。HTTP / CLI / MCP 默认 required，DEV 须显式启用 |
+| 关联文档 | [S02 记忆接口层](../../specs/S02-memory-api.md)、[S07 公共组件层](../../specs/S07-common.md)、[F05 公共安全架构](../../../security-plans/archived/02-f05-migration/plans/F05-common-security-architecture.md)、[PR1/PR2 接口说明文档](../../../security-plans/archived/03-interface-freeze/contracts/2026-08-17-PR1-PR2-接口说明文档.md)、[F04 安全接口与加密设计](F04-security-interfaces-and-encryption.md) |
+| 状态 | PR1 / PR2 已于 2026-10-08 基于当前上游更新，最新 PR2 快照鉴权与 MCP 参数适配见 F14；PR3 已重放到当前 PR2，原基线第七轮验收是历史记录，本轮验证范围见 F15。HTTP / CLI / MCP 默认 required，DEV 须显式启用 |
 
 ## 1. 背景与目标
 
@@ -100,7 +100,9 @@ http.dev_identities；已显式配置 memory_api.security 时保留该运行时�
 
 ## 4. 实装清单（原「暂缓合入清单」）
 
-PR1、PR2 项已交付并通过契约验收，PR3 仍待实装：
+PR1、PR2 的既有验收范围见各自归档。PR3 已交付；第七轮实现复验通过，累计 52 项独立样本全部通过；MCP 实际传输
+仍未验证；补充样本已归入正式 tests/，代码、测试和文档统一纳入一个 PR3 提交。详见
+[PR3 验收记录](../../../security-plans/archived/06-pr3-audit-integrity/reports/2026-09-23-pr3-seventh-acceptance.md)。
 
 - [x] `authentication_impl/`（dev / trusted / api_key 三种 Authenticator 及 KeyStore 后端）
 - [x] `cryptography_impl/`（`local` KeyProvider 与 ENC1 信封 provider，v2 写出 / v1 只读兼容）
@@ -110,8 +112,10 @@ PR1、PR2 项已交付并通过契约验收，PR3 仍待实装：
   `RequestSecurityContext` 受控来源的 PEP 校验、`dispatch` 的 `security=` 参数必填，
   以及删除过渡桥 `common/security/legacy.py` 与全部 `legacy_request_context(...)` 调用点
   （`MemoryAPI` 公开签名已在 PR1 切到 `security=`，余下的是 `dispatch` 与进程内调用方）
-- [ ] PR3：`audit_integrity_impl/`（版本化规范化 + 链式 HMAC 的 `AuditIntegrityProvider`；内存 /
-  SQLite 审计后端叠加 `ChainedAuditStore`；锚点产品实现）与 `LocalKeyProvider` 的 MAC capability
+- [x] PR3：`audit_integrity_impl/`（版本化规范化 + 链式 HMAC 的 `AuditIntegrityProvider`；内存 /
+  SQLite 审计后端叠加 `ChainedAuditStore`）与 `LocalKeyProvider` 的 MAC capability；
+  外部锚点（`AuditAnchor`）无产品实现；provider 的锚点核对使用冻结 `AnchorStatus` 枚举，
+  落后锚点核对本地前缀 digest（验收 PR3-05 已修复）
 
 ## 5. PR2 固定的接口（隔离 / 授权）
 
@@ -309,10 +313,9 @@ def verify_audit(
   `truncated=true`，避免自定义 provider 放大返回体；
 - `truncated` 只表示错误样本列表被有效 `max_samples` 截短，扫描未完成用
   `status=incomplete`，不能复用同一标志掩盖缺页；
-- HTTP `/v1/verify_audit`、CLI `verify_audit` 与 MCP `memory_verify_audit` 已经由真实认证
-  中间件和共享 API 契约暴露该入口。legacy handler 没有同名入口，且其既有方法也必须
-  显式传入可信上下文，不得从 payload 自述 actor。返回体保持下列冻结结构；未装配
-  provider 时返回 `unsupported`，入口可调用不代表 PR3 完整性实现已启用：
+- `jiuwen_memory_entry/core/handler.py` 的旧 dispatch **不注册** `verify_audit`。当前
+  HTTP / CLI 通过共享 `api_contract` 调用同名 MemoryAPI 方法，机械序列化原返回值，
+  不加 `op`；MCP 已有 `memory_verify_audit` 工具，通过 `invoke_api` 调用，透传 after_sequence/page_size/max_samples/anchor_policy 验证参数。下列 `to_body()` 格式保留为契约方法，不等同于当前 HTTP / CLI 返回体：
 
 ```json
 {
@@ -335,14 +338,16 @@ Body 是**对外线上契约**：字段名、类型与样本 Proof 字段一经�
 
 ### 6.5 当前过渡行为（与目标接口的差异）
 
-正式接口如上，但本期**不实装**任何完整性实现（`audit_integrity_impl` 随实装 PR 合入），
-主业务流程不受影响。已知过渡态：
+正式接口如上。PR3 已实装 `chained_hmac`（版本化规范化 + 链式 HMAC）、内存 / SQLite
+`ChainedAuditStore` 与 `LocalKeyProvider` 的 MAC capability。已知过渡态：
 
 | 项 | 目标形态 | 当前过渡行为 |
 |---|---|---|
-| 鉴权动作 | `verify_audit` 使用 `Action.VERIFY_AUDIT`；`audit` 使用 `READ_AUDIT` | PR2 已按目标动作独立判权，普通 READ 不互认 |
+| 鉴权动作 | 两个独立管理面入口 | `verify_audit` 按 `VERIFY_AUDIT`、`audit` 按 `READ_AUDIT` 对根 scope 判权，均继承当前 PR2 |
 | 未装配 provider | —— | `verify_audit` 诚实返回 `unsupported`（`detail="audit integrity provider not configured"`），不抛错、不降级成 clean |
-| `audit_integrity` 配置段 | `chained_hmac` 实现注册 | 无注册 target，配置该段装配失败（fail-closed，不静默降级为普通审计） |
-| `ProtectedAuditLogger` | PEP 与 surface 记录入口都经它 | 无调用点（需要 provider 实例），仅固定接口 |
-| `KeyProvider.mac` | `LocalKeyProvider` 支持 | 默认 `NotImplementedError`（所有 provider） |
-| Surface 暴露 | 认证中间件产出可信上下文后由 HTTP / MCP / CLI 暴露 | 三种形态均经共享 API 契约调用；进程内调用须显式传 `RequestSecurityContext`，legacy handler 不注册该方法 |
+| `audit_integrity` 配置段 | `chained_hmac` 实现注册 | 已注册；以实际 provider 完成接线与 identity 校验（内联组件配置同样接线，验收 PR3-06 已修复）；只有顶层具名段而无 Runtime 引用时仍拒绝启动 |
+| `ProtectedAuditLogger` | PEP 与 surface 记录入口都经它 | 标准具名配置下 `Kernel.audit` 与 PEP 共用 wrapper；受保护写路径统一失败语义（任何底层故障归一为 AuditIntegrityError + degraded 闩），认证入口按 `integrity_protected` 标记 fail-closed（真实 SQLite 写失败亦不吞，复验 R1 已修复）；普通审计吞错语义不变、公共导入面零增删 |
+| mutation 前健康预检 | 业务变更前检查审计健康 | 显式 mutation 入口已有 degraded 闩 + `provider.health()` 预检，add/batch_add 的审计预检已提前到路由解析/空间创建之前（T1 已修复）；不构成跨库原子声明 |
+| `KeyProvider.mac` | `LocalKeyProvider` 支持 | `LocalKeyProvider` 已支持（HKDF 派生独立 MAC 子密钥，与信封加密派生隔离）；其余 provider 默认 `NotImplementedError` |
+| 外部锚点 | `AuditAnchor` 契约与 provider 核对 | 无产品实现；未配置时 `required` 抛 `ValidationError`、默认返回 `checked=False`；已配置锚点产出 `AnchorStatus` 枚举状态，落后锚点核对本地前缀 digest（验收 PR3-05 已修复） |
+| Surface 暴露 | 可信上下文进入同一 MemoryAPI | HTTP / CLI 有同名入口；MCP 透传完整验证参数；旧 generic dispatch 不注册；进程内须显式传 `RequestSecurityContext` |
