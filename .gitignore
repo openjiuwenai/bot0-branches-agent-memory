@@ -40,3 +40,5 @@ deploy/docker/.venv-modelscope/
 .vscode/
 .claude/skills/gitcode-config.json
 CLAUDE.md
+opencode.json
+.claude/

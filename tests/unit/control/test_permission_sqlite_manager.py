@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from common.type_def import Scope
-from control.permission_impl import sqlite_permission_manager
-from control.permission_impl.sqlite_permission_manager import SQLitePermissionManager
-from control.types import Action, Grant, PermissionContext
+from jiuwen_memory.common.type_def import Scope
+from jiuwen_memory.control.permission_impl import sqlite_permission_manager
+from jiuwen_memory.control.permission_impl.sqlite_permission_manager import SQLitePermissionManager
+from jiuwen_memory.control.types import Action, Grant, PermissionContext
 
 pytestmark = pytest.mark.unit
 
@@ -109,7 +109,7 @@ def test_expired_grant_is_rejected(tmp_path) -> None:
         grantor=Scope(org="acme", user="owner"),
         grantee=Scope(org="acme", user="reader"),
         actions=[Action.READ],
-        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        expires_at=datetime.now(UTC) - timedelta(minutes=1),
     )
 
     mgr.grant(grant)
@@ -133,7 +133,7 @@ def test_expired_grant_does_not_block_regrant(tmp_path) -> None:
             grantor=grantor,
             grantee=grantee,
             actions=[Action.READ],
-            expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            expires_at=datetime.now(UTC) - timedelta(minutes=1),
         )
     )
     mgr.grant(
@@ -141,7 +141,7 @@ def test_expired_grant_does_not_block_regrant(tmp_path) -> None:
             grantor=grantor,
             grantee=grantee,
             actions=[Action.READ],
-            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
         )
     )
 

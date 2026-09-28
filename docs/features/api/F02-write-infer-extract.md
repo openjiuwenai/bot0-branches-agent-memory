@@ -4,12 +4,12 @@
 
 | 项 | 值 |
 |---|---|
-| 日期 | 2026-06-30 |
-| 影响范围 | src/control/engine_impl/in_memory_engine.py、src/control/AGENTS.md、bootstrap/core/handler.py、docs/specs/S02-memory-api.md、docs/specs/S03-control.md、docs/features/construction/F01-construction-spec-design.md |
-| 测试基线 | `pytest tests/unit/construction` 全绿（82 passed）；`pytest tests/unit/api` 全绿；`pytest tests/unit` 4 failed（仅 `test_bge_reranker.py`，与本特性无关） |
+| 日期 | 2026-09-05 |
+| 影响范围 | jiuwen_memory/control/engine_impl/in_memory_engine.py、jiuwen_memory/control/AGENTS.md、jiuwen_memory_entry/core/api_contract.py、docs/specs/S02-memory-api.md、docs/specs/S03-control.md、docs/features/construction/F01-construction-spec-design.md |
+| 测试基线 | 历史 A-04 定向回归 15 passed；当时 `pytest tests/unit` 有 4 个既有失败：2 个因未安装可选依赖 `torch`，2 个因 EntityIndexBuilder logger 名与 caplog 监听名不一致，均与本特性无关 |
 | Refs | — |
 
-> 本文归档 **write 路径演进策略的两点变更**：(1) 默认路径不再自动提交 background EXTRACT；(2) 新增 `metadata["infer"]=="true"` 同步抽取开关。两者是一个连贯决策的两面——把"是否在写入时抽取"的选择权从"框架硬编码自动提交"交还给"调用方按场景显式选择"。
+> 本文归档 **write 路径演进策略的两点变更**：(1) 默认路径不再自动提交 background EXTRACT；(2) 新增 `system_metadata["infer"]=="true"` 同步抽取开关。两者是一个连贯决策的两面——把"是否在写入时抽取"的选择权从"框架硬编码自动提交"交还给"调用方按场景显式选择"。
 
 ---
 
@@ -21,7 +21,7 @@
 
 这一立场是为了保住写入时延（agent 等待），其代价是「写入的原始记忆先以 EPISODIC 入库、派生 SEMANTIC 事实要等后台 EXTRACT 跑完才出现」。在两条新诉求下，这个代价变得不可接受：
 
-1. **外接记忆 provider 的同步语义**：`agent_plugin/JiwenSwarm/agent_memory_provider.py` 把本系统适配成 openjiuwen `MemoryProvider`，其 `sync_turn` 契约要求「写完即可被下一轮 `prefetch` 召回派生事实」——若 write 后派生事实要等 background EXTRACT（且 `InProcessScheduler` 当前是**同步执行**，见 F01 已知遗留 1）才出现，provider 的同步语义失效，agent 下一轮检索不到刚写入的事实。
+1. **外接记忆 provider 的同步语义**：`jiuwen_memory_adapter/JiwenSwarm/agent_memory_provider.py` 把本系统适配成 openjiuwen `MemoryProvider`，其 `sync_turn` 契约要求「写完即可被下一轮 `prefetch` 召回派生事实」——若 write 后派生事实要等 background EXTRACT（且 `InProcessScheduler` 当前是**同步执行**，见 F01 已知遗留 1）才出现，provider 的同步语义失效，agent 下一轮检索不到刚写入的事实。
 
 2. **对齐 mem0 `add(infer=True)`**：mem0 的 `add` 支持 `infer=True` 在写入时同步抽取事实。本系统作为可替代 mem0 的独立记忆子系统，需要在 `write` 暴露等价开关，否则上层（如 `ExternalMemoryRail`）无法做语义对等迁移。
 
@@ -36,8 +36,9 @@
 `InMemoryEngine.write` 默认分支（`infer` 非真值）流程改为：
 
 ```
-Ingestor.ingest → 补 assets/tags → Classifier.classify → KVStore.insert（真源）
-→ IndexBuilder.build（hot 索引）
+Engine 构造 RawPayload（含 assets）→ Ingestor.ingest（自行映射 assets）
+→ Engine 补 tags 等编排字段 → Classifier.classify
+→ IndexBuilder.build（统一交付 Storage + 构建 hot 索引）
 → 返回 units
 ```
 
@@ -45,9 +46,9 @@ Ingestor.ingest → 补 assets/tags → Classifier.classify → KVStore.insert�
 
 **为何删而非保留**：`InProcessScheduler` 同步执行下"自动提交 background"是名不副实的——它并不异步，而是同步阻塞 write 直到 EXTRACT 的 LLM 调用跑完。这既没兑现双通道的时延承诺，又让 write 时延不可预测。在控制层换上真异步 Scheduler 之前（S03 范围的已知遗留），自动提交弊大于利，故移除。真异步 Scheduler 落地后，是否在默认路径恢复可选自动提交，另行决策（见已知遗留）。
 
-### 2. `metadata["infer"]=="true"` 同步抽取开关
+### 2. `system_metadata["infer"]=="true"` 同步抽取开关
 
-`write` 据 `metadata["infer"]` 真值（`str(...).strip().lower() == "true"`，大小写/空白不敏感）分两路：
+`write` 据 `system_metadata["infer"]` 真值（`str(...).strip().lower() == "true"`，大小写/空白不敏感）分两路：
 
 - **`infer="true"`**：原始单元只落 KV 真源**不建索引**；hot path 同步调 `self._evolver.evolve(units, EvolveMode.EXTRACT)` 走 Evolver EXTRACT 全链路——`Extractor.extract` 抽取派生记忆 → `_dedup_batch` 判定+落盘+建索引（ADD/UPDATE/SUPERSEDE/NOOP）。**不提交** background EXTRACT（已同步抽取，避免重复）。返回**派生单元列表**（从 `EvolveResult.created_ids` 反查 KV 读回，对齐 mem0 `add(infer=True)` 返回派生事实）。
 - **缺省 / 非 `"true"`**：决策 1 的默认路径——原始落盘 + 建索引，不自动提交演进。
@@ -56,13 +57,18 @@ Ingestor.ingest → 补 assets/tags → Classifier.classify → KVStore.insert�
 
 **evolver 缺失显式报错**：`infer="true"` 但装配未注入 `Evolver`（`None`）时抛 `RuntimeError("Engine.write infer=True requires an Evolver")`——装配问题暴露而非静默降级。默认装配 `evolver: orchestrating` 总是注入，故仅非默认装配才可能触发。
 
-### 3. HTTP handler `/v1/add` 透传 metadata
+### 3. HTTP / CLI 直接传入 API 元数据并保留原返回值
 
-`bootstrap/core/handler.py` 的 `_add`：
-- 校验 `payload["metadata"]` 必须是对象后按原生类型透传给 `api.write`；API 写入边界只
-  接受 JSON 标量或字符串数组，并拒绝系统保留 key。业务 metadata 不再统一
-  string 化，`RawPayload` / `MemoryUnit` / 索引投影保持同一值类型。
-- `infer=true` 下 engine 可能合法返回空列表（派生记忆全部被 dedup 判为 update/noop，`created_ids` 为空）。此时**不伪造 item_id**，如实返回 `{"ok": True, "op": "add", "item_id": None, "item": None, "skipped": "all derived memories deduped (update/noop)"}`——让调用方知道"写入被去重吸收"而非误以为"新建了一条"。
+HTTP `/v1/add` 与 CLI `add` 不经过 legacy handler，而是通过共享
+`core/api_contract.py` 调用 `MemoryAPI.add`：
+
+- `system_metadata` 承载 `infer` / `procedural` 等内核解释字段，
+  `user_metadata` 承载业务自定义字段；不接受混合 `metadata` 参数，拆分规则见 API F04。
+- JSON 对象按同名参数传入，保留 API 支持的标量或字符串数组类型；不统一 string 化，
+  API 写入边界仍校验类型和保留 key。
+- `infer=true` 下可能合法返回空列表（本次没有新建的派生单元）。HTTP 返回
+  `200 OK` 和 `[]`，CLI 的 JSON 输出也是 `[]`；不伪造 `item_id`，不额外添加
+  `ok` / `op` / `skipped`。旧 envelope 只属于 MCP 等 legacy handler 调用方。
 
 ## 拒绝的方案
 
@@ -98,21 +104,21 @@ Ingestor.ingest → 补 assets/tags → Classifier.classify → KVStore.insert�
 
 ### 单元测试
 
-- `tests/unit/construction/test_evolver_dedup.py` — 13 passed：去重四态（ADD/UPDATE/SUPERSEDE/NOOP）+ 降级场景。其中 supersede/update/json-fallback 三例用 `dedup_high_similarity=1.01` 抬高短路阈值，强制走 LLM 判定分支验证（见 [construction F01](../construction/F01-construction-spec-design.md) 测试基线）
+- `tests/unit/construction/test_evolver_dedup.py` — 13 passed：去重四态（ADD/UPDATE/SUPERSEDE/NOOP）+ 降级场景 + 高相似实质差异改走 LLM。其中 supersede/update/json-fallback 三例用 `dedup_high_similarity=1.01` 抬高短路阈值，强制走 LLM 判定分支验证（见 [construction F01](../construction/F01-construction-spec-design.md) 测试基线）
 - `tests/unit/construction/test_extractor.py` — 14 passed：含 `test_extract_batch` 批量提取一次调用返回全部候选、source_id 回指正确源 unit
 - `tests/unit/api` — 全绿：write 路径 + 装配
 
 ### 端到端验证
 
-- `agent_plugin/JiwenSwarm/_e2e_real.py` — provider ↔ 服务(8137) 全链路：conclude / sync_turn(infer=true) / on_session_end / prefetch / search / profile
-- `examples/quickstart*.py` — write → recall → get → update → evolve 全链路
+- `jiuwen_memory_adapter/JiwenSwarm/_e2e_real.py` — provider ↔ 服务(8137) 全链路：conclude / sync_turn(infer=true) / on_session_end / prefetch / search / profile
+- `examples/quickstart*.py` — add → search → get → update → evolve 全链路
 
 ### 关键场景验证
 
 | 场景 | 验证方式 | 结果 |
 |------|---------|------|
 | infer=true 同步抽取可被下一轮召回 | provider `sync_turn` 后 `prefetch` 命中派生事实 | ✅ |
-| infer=true 全 dedup 合法返空 | handler `/v1/add` 返回 `item_id=null, skipped=...` | ✅ |
+| infer=true 全 dedup 合法返空 | API 返回 `[]`；HTTP 为 `200` + `[]`，CLI JSON 为 `[]`，不添加业务包装 | ✅ |
 | 默认 write 不触发后台 EXTRACT | write 后无 background 任务、时延不被 LLM 拖累 | ✅ |
 | evolver 缺失 + infer=true | 抛 RuntimeError（装配问题暴露） | ✅ |
 
@@ -165,13 +171,13 @@ infer=true 同步抽取时，**evolver 内部**收集两类上下文参考项（
 
 `recent_originals` 不参与去重——原文与派生事实语义粒度不同，按相似度判重复易误删（如原文"我喜欢猫"和派生"用户喜欢猫"）。原文"防重复"由 extractor"只从本轮提取"的语义 + `_dedup_batch` 全库向量去重兜底覆盖。
 
-**收集逻辑放 evolver**（非 engine）：`_maybe_collect_extract_context` 检测 `metadata["infer"]=="true"` → `_recent_infer_originals`（`scan(/messages/)` + 按 `t_ingest` 降序取 10，排除本轮自身）+ `_related_memories`（`dedup.recall` 召回，复用去重向量空间，返回完整 MemoryUnit）。任一步失败降级为空列表，不阻断。
+**收集逻辑放 evolver**（非 engine）：`_maybe_collect_extract_context` 检测 `system_metadata["infer"]=="true"` → `_recent_infer_originals`（`scan(/messages/)` + 按 `t_ingest` 降序取 10，排除本轮自身）+ `_related_memories`（`dedup.recall` 召回，复用去重向量空间，返回完整 MemoryUnit）。任一步失败降级为空列表，不阻断。
 
 **extracted 为空跳过 dedup**：`extractor.extract` 返回空时，evolver 直接返回空 `EvolveResult()`，不调 `_dedup_batch`（空列表走去重无意义、省一次召回）。CONSOLIDATE 同理。
 
 ### 决策8：过程记忆抽取（procedural=true）
 
-新增独立于 infer 的调用级开关 `metadata["procedural"]=="true"`，触发**过程记忆抽取**：
+新增独立于 infer 的调用级开关 `system_metadata["procedural"]=="true"`，触发**过程记忆抽取**：
 
 - 原文**不落 KV**（不进 `/messages/` 也不进 `/memory/`）。
 - evolver EXTRACT 分支检测 procedural → **跳过 context 收集**（不检索 10 条、不拉 10 条）、**跳过 `_dedup_batch`**，extractor 产 1 条 PROCEDURAL 执行历史直接 `_persist` 落 `/memory/` 建索引。
@@ -202,32 +208,38 @@ procedural 与 infer 互斥：procedural=true 时 even 不走 infer 的原文落
 
 ### 决策10：/v1/list 收窄到 /memory/ 全部
 
-handler `_list` 的返回范围由全扫 `kv.scan(scope)` + loads 过滤，收窄为只返 `/memory/` 下的建索引 Memory 记忆，不再返 `/messages/` 下的 infer 原文（未建索引）和 `/index/chunks/` 簿记。
+历史 handler `_list` 的返回范围由全扫 `kv.scan(scope)` + loads 过滤，收窄为只返 `/memory/` 下的建索引 Memory 记忆，不再返 `/messages/` 下的 infer 原文（未建索引）和 `/index/chunks/` 簿记。
 
 后续 F01 的 list 决策已将 `list` 上收为正式
-`MemoryAPI.list -> MemoryEngine.list -> KVStore.list` 数据面接口；handler `_list`
-不再直连 KV。`KVStore.list` 只查询 `/memory/`，并在存储适配器内完成过滤、精确计数、
+`MemoryAPI.list -> MemoryEngine.list -> KVStore.list` 数据面接口。当前 HTTP / CLI
+直接调用 API，MCP 等 legacy handler 的 `_list` 也委托该 API，不再直连 KV。`KVStore.list` 只查询 `/memory/`，并在存储适配器内完成过滤、精确计数、
 稳定排序和分页。
 
-InProcess 模式 `list_semantic` 同步对齐：去掉 `tier==SEMANTIC` 过滤，改用 `prefix=MEMORY_KEY_PREFIX` 直取，返 `/memory/` 全部（与 HTTP `_list` 一致）。两条链路返回范围统一。返回结构差异保留（HTTP 经 `_unit_view` 返完整字段，InProcess 返 `{content, item_id, score}`——provider 客户端协议既有差异，`agent_memory_profile` 只取 content，兼容）。
+本仓库 provider 的 InProcess `list_semantic` 当前调用 `MemoryAPI.list`，不按
+`tier==SEMANTIC` 过滤，再将结果转为 provider 自身的 `{content, item_id, score}`。
+HTTP / CLI 则直接序列化 `MemoryListResult`（`items` 和 `count`），其中 unit 使用原字段，
+不经 `_unit_view`。provider 的远程客户端仍使用旧 flat payload / envelope，尚未适配
+当前 HTTP，不能把旧 provider 的返回协议当成当前服务端协议。
 
 ### 决策11：provider 新增 agent_memory_procedural 工具
 
-`agent_plugin/jiuwenswarm/agent_memory_provider.py` 新增第 4 个工具 `agent_memory_procedural`：
+`jiuwen_memory_adapter/jiuwenswarm/agent_memory_provider.py` 新增第 4 个工具 `agent_memory_procedural`：
 
 - `PROCEDURAL_SCHEMA`：参数 `content`（要汇总的本轮内容），description 说明"汇总成 1 条 procedural 记录、原文不存、不去重不检索"。
-- `handle_tool_call` 分支：调 `self._client.write(content, scope, metadata={"procedural": "true"})` → 经 engine procedural 分支。返回 `{result, item_id}`。
+- `handle_tool_call` 分支：调 `self._client.add(content, scope, system_metadata={"procedural": "true"})` → 经 engine procedural 分支。返回 `{result, item_id}`。
 - `get_tool_schemas` 加入它；`system_prompt_block` 补引导语。
 
-工具经 HTTP `/v1/add`（metadata 透传 procedural=true）或 InProcess `write_async` 都触发 procedural 分支。需配 `extractor:llm` 才真汇总（默认 keyword 降级为原文原样存 1 条 PROCEDURAL）。
+当前 InProcess 工具通过 `add_async(..., system_metadata={"procedural": "true"})` 触发
+procedural 分支。直接调用 HTTP `/v1/add` 时传同名 `system_metadata` 也具有该语义，
+但本仓库 provider 远程客户端尚待适配新 HTTP 契约。需配 `extractor:llm` 才真汇总（默认 keyword 降级为原文原样存 1 条 PROCEDURAL）。
 
 ### 决策12：`infer=true + middle=true` 中期缓冲子路径
 
-`write` 的 `infer=true` 分支下按 `middle` 二级开关再分流。`middle=true` 触发中期缓冲子路径，落地细节见 [`F06-middle-term-memory`](../control/F06-middle-term-memory.md)，这里只列与 write 路径决策相关的部分：
+`add` 的 `infer=true` 分支下按 `middle` 二级开关再分流。`middle=true` 触发中期缓冲子路径，落地细节见 [`F06-middle-term-memory`](../control/F06-middle-term-memory.md)，这里只列与 write 路径决策相关的部分：
 
-- 原文落 `/memory/{id}`（与建索引记忆同前缀，不走 `/messages/`）+ 建索引（原文立即可检索）+ 打 `tier=WORKING` 与 `metadata["middle"]="true"` 标记。
-- 提交 `MiddleToLongJob` 给 Scheduler——`interval=self._middle_interval`（编排周期，属 Engine 编排职责，故留 Engine 而非 JobFactory）。Scheduler 把它注册到 per scope TimerWheel，Timer 协程周期生成实例入队，每个实例跑一次 `run()` 即返回。
-- MiddleToLongJob 内做：list 候选（`tier=WORKING + lifecycle=ACTIVE + metadata["middle"]="true"`）→ 连续性检测切批 → `evolver.evolve(batch, EXTRACT)` → 原文归档（`lifecycle.transition(ARCHIVED) + index.remove`）。
+- 原文落 `/memory/{id}`（与建索引记忆同前缀，不走 `/messages/`）+ 建索引（原文立即可检索）+ 打 `tier=WORKING` 与 `system_metadata["middle"]="true"` 标记。
+- 提交 `MiddleToLongJob` 给 Scheduler——`interval` 经 `factory.get_job(interval=...)` 注入：write 入参 `metadata["middle_interval"]` 在入口经 `parse_middle_interval` 校验（非法值落盘前抛 `ValidationError`），缺省由 `MiddleToLongJobSpec.interval` 装配期默认兜底。Scheduler 把它注册到 per scope TimerWheel，Timer 协程周期生成实例入队，每个实例跑一次 `run()` 即返回。
+- MiddleToLongJob 内做：list 候选（`tier=WORKING + lifecycle=ACTIVE + system_metadata["middle"]=="true"`）→ 连续性检测切批 → `evolver.evolve(batch, EXTRACT)` → 原文归档（`lifecycle.transition(ARCHIVED) + index.remove`）。
 
 **为何 middle 是 infer 的二级开关**：middle 路径要原文立即可检索（落 `/memory/` + 建索引），与 infer=true 同步抽取语义冲突（infer 原文不建索引、走 `/messages/`）。故 middle=true 必须在 infer=true 下生效，且走自己的子分支——分支内不再调 infer 的同步抽取，原文只落 KV 不抽取，抽取由后台 MiddleToLongJob 周期触发。
 

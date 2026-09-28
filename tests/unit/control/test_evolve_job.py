@@ -10,13 +10,13 @@ import asyncio
 
 import pytest
 
-from common.type_def import MemoryUnit, Segment, Scope, memory_key
-from common.type_def.memory_codec import dumps
-from construction import EvolveMode, EvolveResult, Evolver
-from construction.base import OperatorType
-from control.jobs_impl.evolve_job import EvolveJob
-from control.types import JobStatus
-from storage.kv_impl.in_memory_kv_store import InMemoryKVStore
+from jiuwen_memory.common.type_def import MemoryUnit, Scope, Segment, memory_key
+from jiuwen_memory.common.type_def.memory_codec import dumps
+from jiuwen_memory.construction import EvolveMode, Evolver, EvolveResult
+from jiuwen_memory.construction.base import OperatorType
+from jiuwen_memory.control.jobs_impl.evolve_job import EvolveJob
+from jiuwen_memory.control.types import JobStatus
+from jiuwen_memory.storage.kv_impl.in_memory_kv_store import InMemoryKVStore
 
 pytestmark = pytest.mark.unit
 
@@ -52,7 +52,7 @@ def _make_unit(uid: str, scope: Scope, content: str) -> MemoryUnit:
 def _make_middle_unit(uid: str, scope: Scope, content: str) -> MemoryUnit:
     """带 ``metadata["middle"]="true"`` 标记的中期记忆单元。"""
     return MemoryUnit(
-        id=uid, scope=scope, segments=[Segment(content=content)], metadata={"middle": "true"}
+        id=uid, scope=scope, segments=[Segment(content=content)], system_metadata={"middle": "true"}
     )
 
 
@@ -100,7 +100,12 @@ def test_run_calls_evolver_with_explicit_mode_from_constructor() -> None:
     kv.insert(scope, memory_key("unit-1"), dumps(_make_unit("unit-1", scope, "one")))
     evolver = RecordingEvolver()
 
-    job = EvolveJob(scope=scope, kv=kv, evolver=evolver, mode=EvolveMode.CONSOLIDATE)
+    job = EvolveJob(
+        scope=scope,
+        kv=kv,
+        evolver=evolver,
+        mode=EvolveMode.CONSOLIDATE,
+    )
     info = asyncio.run(job.run())
 
     _, mode = evolver.calls[0]
@@ -160,7 +165,9 @@ def test_run_excludes_middle_marked_units_from_evolver_input() -> None:
     kv.insert(scope, memory_key("long-2"), dumps(_make_unit("long-2", scope, "another long")))
     # 中期记忆原文——应被排除
     kv.insert(scope, memory_key("mid-1"), dumps(_make_middle_unit("mid-1", scope, "middle raw")))
-    kv.insert(scope, memory_key("mid-2"), dumps(_make_middle_unit("mid-2", scope, "another middle")))
+    kv.insert(
+        scope, memory_key("mid-2"), dumps(_make_middle_unit("mid-2", scope, "another middle"))
+    )
     evolver = RecordingEvolver()
 
     job = EvolveJob(scope=scope, kv=kv, evolver=evolver)
@@ -174,7 +181,11 @@ def test_run_excludes_middle_marked_units_from_evolver_input() -> None:
 def test_job_default_interval_is_zero_meaning_one_shot() -> None:
     """默认 interval=0 表示一次性任务（语义校验，非 run 行为）。"""
     scope = Scope(org="acme", user="u1")
-    job = EvolveJob(scope=scope, kv=InMemoryKVStore(), evolver=RecordingEvolver())
+    job = EvolveJob(
+        scope=scope,
+        kv=InMemoryKVStore(),
+        evolver=RecordingEvolver(),
+    )
     assert job.interval == 0
 
 

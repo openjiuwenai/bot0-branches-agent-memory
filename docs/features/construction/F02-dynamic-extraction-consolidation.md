@@ -3,8 +3,8 @@
 ## 元信息
 | 项 | 值 |
 |---|---|
-| 日期 | 2026-07-25 |
-| 影响范围 | src/construction/，src/control/，src/config/，docs/specs/S05-construction.md |
+| 日期 | 2026-09-05 |
+| 影响范围 | jiuwen_memory/construction/，jiuwen_memory/control/，jiuwen_memory/config/，docs/specs/S05-construction.md |
 | 测试基线 | 见“验证” |
 | Refs | — |
 
@@ -40,9 +40,10 @@ SUPERSEDE/NOOP 判定和写入动作长期藏在 Evolver 内，职责上属于�
    - 落盘延后到 reflect 步之后统一执行。
 4. **新增 `DynamicEvolver`**（`evolver_impl/dynamic_evolver.py`），继承 `OrchestratingEvolver`，覆盖 `_evolve_extract` 走四步：`extract → consolidate(判定) → reflect → 落盘`。与 `OrchestratingEvolver` 平级（同属 `evolver` 顶层命名空间，注册名 `dynamic` / `orchestrating`）；其余三模式（CONSOLIDATE/ASSOCIATE/FORGET）继承父类。装配或 pipeline profile 选哪个 evolver 实例即启用哪条 EXTRACT 路径——不再需要 `evolver_mode` 开关或 `memory_operator` 注入。
 5. **consolidate 只判定不落盘**：consolidate 步对每个候选调 `Dedup.recall` 召回已有
-   记忆，按相似度阈值 + LLM 判定产出 `ConsolidateDecision`。无命中 → ADD；高相似度
-   （≥ `dedup_high_similarity`）→ NOOP；中段 → 查 `PromptRegistry` 取 consolidate prompt
-   调 LLM 判定；无 prompt 或 LLM 失败 → 回退规则。
+   记忆，按相似度阈值 + LLM 判定产出 `ConsolidateDecision`。无命中 → ADD；高相似度且
+   `should_direct_noop` 为真 → NOOP；高相似但有实质差异（`has_meaningful_delta`）→ 走
+   LLM；中段 → 查 `PromptRegistry` 取 consolidate prompt 调 LLM 判定；无 prompt 或 LLM
+   失败 → 回退规则（高相似且无实质差异才 NOOP，否则 ADD）。
 6. **reflect 默认 no-op**：基类 `_reflect_step` 直接返回候选；子类可覆盖以在落盘前做
    反思修正。这一步为后续"反思型记忆"扩展预留接入点。
 7. **prompt 配置化**：新增 yml 顶层 `prompts` 段（按 phase → key → 文本），由
@@ -89,7 +90,7 @@ SUPERSEDE/NOOP 判定和写入动作长期藏在 Evolver 内，职责上属于�
   失败隔离、无 prompt 回退、registry 缺失时回退内联文本。
 - `PromptRegistry`：按 phase+key 取文本、缺失返回 None、空配置容错。
 - `DynamicEvolver`：无命中 ADD 落盘；中段 LLM 判定 SUPERSEDE；非法 LLM 响应回退
-  ADD；高相似度 NOOP 不落盘；procedural 走父类路径。
+  ADD；高相似且无实质差异时 NOOP 不落盘；高相似但有实质差异走 LLM；procedural 走父类路径。
 - Engine：默认直写路径两次重复写入都落盘（去重交给显式 evolve）。
 - `pytest -m unit`：132 passed。
 - `pytest tests/integration`：通过（仅外部服务依赖项 skipped：redis/milvus/
@@ -98,8 +99,9 @@ SUPERSEDE/NOOP 判定和写入动作长期藏在 Evolver 内，职责上属于�
 
 ## 已知遗留
 
-- CLI/MCP 尚未为 metadata prompt key 提供专用参数，当前通过 Python API、HTTP payload 或
-  batch NDJSON 传递。
+- CLI 已通过 `--system_metadata` 接收包含 prompt key 的 JSON 对象，HTTP 使用同名
+  `system_metadata` 字段；CLI batch NDJSON 也使用同一字段。MCP 仍走 legacy handler，
+  没有为各个 prompt key 单独增加工具参数。
 - reflect 步默认 no-op，"反思型记忆"的具体语义留待后续特性扩展。
 - 旧 pipeline profile 未声明 evolver 时默认走 `orchestrating`（legacy）；改为 `dynamic`
   才启用动态四步编排。

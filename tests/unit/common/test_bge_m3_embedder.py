@@ -9,10 +9,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from common.base import PluginType
-from common.embedder.embedder_impl import EmbedderProducer
-from common.embedder.embedder_impl.bge_m3_embedder import BGEM3Embedder
-from common.errors import HealthCheckError
+from jiuwen_memory.common.base import PluginType
+from jiuwen_memory.common.embedder.embedder_impl import EmbedderProducer
+from jiuwen_memory.common.embedder.embedder_impl.bge_m3_embedder import BGEM3Embedder
+from jiuwen_memory.common.errors import HealthCheckError
 
 # ---------------------------------------------------------------------------
 # Helper: Mock BGEM3FlagModel
@@ -164,8 +164,7 @@ def test_embed_query():
 def test_health():
     """T-BM3-10: health 正常时返回 None。"""
     embedder = _make_mock_embedder()
-    result = embedder.health()
-    assert result is None
+    assert embedder.health() is None
 
 
 def test_health_failure():
@@ -255,6 +254,7 @@ def test_fp16_disabled_on_cpu(monkeypatch):
     fake_mod.BGEM3FlagModel = MockBGEM3Model
     monkeypatch.setitem(sys.modules, "FlagEmbedding", fake_mod)
     # mock torch.cuda.is_available 返回 False（CPU 环境）
+    pytest.importorskip("torch")
     import torch
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
@@ -271,6 +271,7 @@ def test_fp16_kept_on_cuda(monkeypatch):
     fake_mod = types.ModuleType("FlagEmbedding")
     fake_mod.BGEM3FlagModel = MockBGEM3Model
     monkeypatch.setitem(sys.modules, "FlagEmbedding", fake_mod)
+    pytest.importorskip("torch")
     import torch
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
@@ -291,7 +292,7 @@ def test_producer_known():
 
 def test_producer_create():
     """T-BM3-P02: EmbedderProducer.create("bge_m3") 返回 BGEM3Embedder 实例。"""
-    from config import AssemblyContext
+    from jiuwen_memory.config import AssemblyContext
     embedder = EmbedderProducer.build("bge_m3", {"embedder_dim": 1024}, AssemblyContext())
     assert isinstance(embedder, BGEM3Embedder)
     assert embedder.dimension() == 1024
@@ -300,7 +301,7 @@ def test_producer_create():
 
 def test_producer_unknown_type():
     """T-BM3-P03: 不支持的 embedder_type 抛 ValidationError。"""
-    from common.errors import ValidationError
-    from config import AssemblyContext
+    from jiuwen_memory.common.errors import ValidationError
+    from jiuwen_memory.config import AssemblyContext
     with pytest.raises(ValidationError):
         EmbedderProducer.build("unknown", {}, AssemblyContext())

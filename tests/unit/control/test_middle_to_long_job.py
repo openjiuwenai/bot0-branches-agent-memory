@@ -12,31 +12,32 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
-from common.type_def import (
+from jiuwen_memory.common.base import PluginType
+from jiuwen_memory.common.llm.base import LLM
+from jiuwen_memory.common.type_def import (
     LifecycleState,
     MemoryTier,
     MemoryUnit,
-    Segment,
     Scope,
+    Segment,
     Temporal,
     memory_key,
 )
-from common.type_def.memory_codec import dumps
-from construction import EvolveMode, EvolveResult, Evolver
-from construction.base import OperatorType
-from construction.index_builder import IndexBuilder
-from common.base import PluginType
-from common.llm.base import LLM
-from common.type_def.chat import ChatMessage
-from control.base import ControlOperatorType
-from control.jobs_impl.middle_to_long_job import MiddleToLongJob
-from control.lifecycle import LifecycleManager
-from control.types import JobStatus
-from storage.kv_impl.in_memory_kv_store import InMemoryKVStore
+from jiuwen_memory.common.type_def.chat import ChatMessage
+from jiuwen_memory.common.type_def.memory_codec import dumps
+from jiuwen_memory.construction import EvolveMode, Evolver, EvolveResult
+from jiuwen_memory.construction.base import OperatorType
+from jiuwen_memory.construction.index_builder import IndexBuilder
+from jiuwen_memory.control.base import ControlOperatorType
+from jiuwen_memory.control.jobs_impl.middle_to_long_job import MiddleToLongJob
+from jiuwen_memory.control.lifecycle import LifecycleManager, SweepTransition
+from jiuwen_memory.control.types import JobStatus
+from jiuwen_memory.storage.kv_impl.in_memory_kv_store import InMemoryKVStore
+from jiuwen_memory.storage.types import IndexRemoveMode, IndexWriteMode
 
 pytestmark = pytest.mark.unit
 
@@ -84,7 +85,7 @@ class _RecordingLifecycle(LifecycleManager):
     def supersede(self, scope: Scope, unit_id: str, invalid_at: datetime) -> MemoryUnit:
         raise AssertionError("MiddleToLongJob should not call supersede")
 
-    def sweep(self) -> list[str]:
+    def sweep(self) -> list[SweepTransition]:
         return []
 
 
@@ -100,13 +101,13 @@ class _RecordingIndex(IndexBuilder):
     def health(self) -> None:
         return None
 
-    def build(self, units) -> None:
+    def build(self, units, *, mode: IndexWriteMode = IndexWriteMode.ALL) -> None:
         return None
 
-    def update(self, units) -> None:
+    def update(self, units, *, mode: IndexWriteMode = IndexWriteMode.ALL) -> None:
         return None
 
-    def remove(self, units) -> None:
+    def remove(self, units, *, mode: IndexRemoveMode = IndexRemoveMode.HARD) -> None:
         self.removed.extend(units)
 
     def rebuild(self) -> None:
@@ -168,7 +169,7 @@ def _make_unit(
         lifecycle=lifecycle,
         segments=[Segment(content=content)],
         temporal=Temporal(t_ingest=t_ingest),
-        metadata=metadata,
+        system_metadata=metadata,
     )
     return unit
 
@@ -238,9 +239,9 @@ def test_list_working_units_sorted_by_t_ingest_ascending() -> None:
     """按 t_ingest 升序——早的在前。"""
     scope = Scope(user="u1")
     kv = InMemoryKVStore()
-    t1 = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
-    t2 = datetime(2026, 7, 1, 13, 0, tzinfo=timezone.utc)
-    t3 = datetime(2026, 7, 1, 11, 0, tzinfo=timezone.utc)  # 最早
+    t1 = datetime(2026, 7, 1, 12, 0, tzinfo=UTC)
+    t2 = datetime(2026, 7, 1, 13, 0, tzinfo=UTC)
+    t3 = datetime(2026, 7, 1, 11, 0, tzinfo=UTC)  # 最早
     kv.insert(scope, memory_key("u1"), dumps(_make_unit("u1", scope, "c1", t_ingest=t1)))
     kv.insert(scope, memory_key("u2"), dumps(_make_unit("u2", scope, "c2", t_ingest=t2)))
     kv.insert(scope, memory_key("u3"), dumps(_make_unit("u3", scope, "c3", t_ingest=t3)))
@@ -261,7 +262,7 @@ def test_list_working_units_truncates_to_max_fetch() -> None:
             memory_key(f"u{i}"),
             dumps(
                 _make_unit(
-                    f"u{i}", scope, f"c{i}", t_ingest=datetime(2026, 1, 1, i, 0, tzinfo=timezone.utc)
+                    f"u{i}", scope, f"c{i}", t_ingest=datetime(2026, 1, 1, i, 0, tzinfo=UTC)
                 )
             ),
         )
@@ -357,7 +358,8 @@ def test_split_by_continuity_continuous_within_batch_size() -> None:
     scope = Scope(user="u1")
     job, _, _, _, _ = _build_job(scope, InMemoryKVStore(), batch_size=10)
     # 注入 LLM 响应——连续 true
-    job._llm._responses = ['{"results":["true"]}'] * 5  # 6 个 unit → 5 次比较  # pylint: disable=protected-access
+    # 6 个 unit → 5 次比较
+    job._llm._responses = ['{"results":["true"]}'] * 5  # pylint: disable=protected-access
     units = [_make_unit(f"u{i}", scope, f"c{i}") for i in range(6)]
 
     batches = asyncio.run(job._split_by_continuity(units))  # pylint: disable=protected-access
@@ -370,7 +372,8 @@ def test_split_by_continuity_breaks_on_false() -> None:
     """连续 false → 切批（每个 unit 独立成批）。"""
     scope = Scope(user="u1")
     job, _, _, _, _ = _build_job(scope, InMemoryKVStore())
-    job._llm._responses = ['{"results":["false"]}'] * 3  # 4 个 unit → 3 次比较全 false  # pylint: disable=protected-access
+    # 4 个 unit → 3 次比较全 false
+    job._llm._responses = ['{"results":["false"]}'] * 3  # pylint: disable=protected-access
     units = [_make_unit(f"u{i}", scope, f"c{i}") for i in range(4)]
 
     batches = asyncio.run(job._split_by_continuity(units))  # pylint: disable=protected-access
@@ -388,7 +391,8 @@ def test_split_by_continuity_respects_batch_size_upper_bound() -> None:
     """
     scope = Scope(user="u1")
     job, _, _, _, _ = _build_job(scope, InMemoryKVStore(), batch_size=3)
-    job._llm._responses = ['{"results":["true"]}'] * 5  # 全部连续  # pylint: disable=protected-access
+    # 全部连续
+    job._llm._responses = ['{"results":["true"]}'] * 5  # pylint: disable=protected-access
     units = [_make_unit(f"u{i}", scope, f"c{i}") for i in range(6)]
 
     batches = asyncio.run(job._split_by_continuity(units))  # pylint: disable=protected-access
@@ -459,7 +463,8 @@ def test_run_serial_path_calls_evolver_and_archives_processed() -> None:
     job, evolver, lifecycle, index, _ = _build_job(
         scope, kv, concurrency=1, batch_size=10
     )
-    job._llm._responses = ['{"results":["true"]}']  # 2 unit → 1 次比较  # pylint: disable=protected-access
+    # 2 unit → 1 次比较
+    job._llm._responses = ['{"results":["true"]}']  # pylint: disable=protected-access
 
     info = asyncio.run(job.run())
 
@@ -568,8 +573,8 @@ def test_in_process_scheduler_runs_middle_to_long_job_concurrent_path() -> None:
     改造后:submit/job.run 均 async,直接 await asyncio.gather。本测试断言
     该路径不再崩溃 + 并发分支真实跑通(evolver 收 2 批 + 原文被归档)。
     """
-    from control.scheduler_impl.in_process_scheduler import InProcessScheduler
-    from control.types import Channel
+    from jiuwen_memory.control.scheduler_impl.in_process_scheduler import InProcessScheduler
+    from jiuwen_memory.control.types import Channel
 
     scope = Scope(user="u1")
     kv = InMemoryKVStore()
@@ -601,8 +606,8 @@ def test_in_process_scheduler_runs_middle_to_long_job_serial_path() -> None:
     (to_thread 在 asyncio.run 创建的循环里能正常工作),但 SUCCEEDED 状态
     流需验证。
     """
-    from control.scheduler_impl.in_process_scheduler import InProcessScheduler
-    from control.types import Channel
+    from jiuwen_memory.control.scheduler_impl.in_process_scheduler import InProcessScheduler
+    from jiuwen_memory.control.types import Channel
 
     scope = Scope(user="u1")
     kv = InMemoryKVStore()
@@ -632,8 +637,8 @@ def test_in_process_scheduler_runs_middle_to_long_job_no_candidates() -> None:
     detail 含 is_done=true。这是原崩溃路径 ① 的边界面——空候选时 job.run
     早返回,不触发 gather,但状态流仍需正确。
     """
-    from control.scheduler_impl.in_process_scheduler import InProcessScheduler
-    from control.types import Channel
+    from jiuwen_memory.control.scheduler_impl.in_process_scheduler import InProcessScheduler
+    from jiuwen_memory.control.types import Channel
 
     scope = Scope(user="u1")
     kv = InMemoryKVStore()  # 空 KV

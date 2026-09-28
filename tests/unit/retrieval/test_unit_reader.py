@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from common.type_def import (
+from jiuwen_memory.common.type_def import (
     T_INVALID_OPEN,
     FilterClause,
     FilterGroup,
@@ -15,20 +15,20 @@ from common.type_def import (
     memory_key,
     normalize,
 )
-from common.type_def.memory import LifecycleState
-from common.type_def.memory_codec import dumps
-from retrieval.retriever_impl.unit_reader import (
+from jiuwen_memory.common.type_def.memory import LifecycleState
+from jiuwen_memory.common.type_def.memory_codec import dumps
+from jiuwen_memory.retrieval.retriever_impl.unit_reader import (
     UnitReader,
     in_event_window,
     matches_filters,
     passes,
     valid_at,
 )
-from storage.kv_impl.in_memory_kv_store import InMemoryKVStore
+from jiuwen_memory.storage.kv_impl.in_memory_kv_store import InMemoryKVStore
 
 pytestmark = pytest.mark.unit
 
-NOW = datetime(2026, 6, 16, tzinfo=timezone.utc)
+NOW = datetime(2026, 6, 16, tzinfo=UTC)
 
 
 def test_current_query_allows_active_only(unit_factory) -> None:
@@ -211,37 +211,37 @@ def test_filter_not_negates_child(unit_factory) -> None:
 def test_filter_numeric_predicate_on_native_number_metadata(unit_factory) -> None:
     # metadata 值是 JSON 标量原生类型：数值范围过滤直接生效，与后端下推同语义。
     unit = unit_factory("a", "x")
-    unit.metadata["priority"] = 9
+    unit.user_metadata["priority"] = 9
 
-    assert matches_filters(unit, FilterClause("metadata.priority", FilterOp.GTE, 8))
-    assert matches_filters(unit, FilterClause("metadata.priority", FilterOp.GTE, 9))
-    assert not matches_filters(unit, FilterClause("metadata.priority", FilterOp.GT, 9))
-    assert not matches_filters(unit, FilterClause("metadata.priority", FilterOp.LT, 8))
+    assert matches_filters(unit, FilterClause("user_metadata.priority", FilterOp.GTE, 8))
+    assert matches_filters(unit, FilterClause("user_metadata.priority", FilterOp.GTE, 9))
+    assert not matches_filters(unit, FilterClause("user_metadata.priority", FilterOp.GT, 9))
+    assert not matches_filters(unit, FilterClause("user_metadata.priority", FilterOp.LT, 8))
 
 
 def test_filter_int_and_float_compare_across_units(unit_factory) -> None:
     # 同一 key 上 int 与 float 混存：真源复核按数值比较，不因写入形态分叉。
     # 对应 ES 侧 long→double 的 dynamic_template（首条整数不得把字段锁成整型）。
     as_int = unit_factory("a", "x")
-    as_int.metadata["priority"] = 8
+    as_int.user_metadata["priority"] = 8
     as_float = unit_factory("b", "x")
-    as_float.metadata["priority"] = 9.5
+    as_float.user_metadata["priority"] = 9.5
 
-    gte_9 = FilterClause("metadata.priority", FilterOp.GTE, 9)
+    gte_9 = FilterClause("user_metadata.priority", FilterOp.GTE, 9)
     assert not matches_filters(as_int, gte_9)
     assert matches_filters(as_float, gte_9)
     # 9.5 必须能被自己的精确值命中——被截断成 9 就查不出来
-    assert matches_filters(as_float, FilterClause("metadata.priority", FilterOp.GTE, 9.5))
+    assert matches_filters(as_float, FilterClause("user_metadata.priority", FilterOp.GTE, 9.5))
 
 
 def test_filter_numeric_predicate_on_string_metadata_is_false_not_crash(unit_factory) -> None:
     # 类型不匹配（该 key 存的是字符串，谓词是数值）：判否而非抛 TypeError 中断整次
     # 检索。与 Milvus JSON 字段一致——类型严格、静默跳过，不做隐式转换。
     unit = unit_factory("a", "x")
-    unit.metadata["priority"] = "high"
+    unit.user_metadata["priority"] = "high"
 
-    assert not matches_filters(unit, FilterClause("metadata.priority", FilterOp.GTE, 8))
-    assert not matches_filters(unit, FilterClause("metadata.priority", FilterOp.LT, 8))
+    assert not matches_filters(unit, FilterClause("user_metadata.priority", FilterOp.GTE, 8))
+    assert not matches_filters(unit, FilterClause("user_metadata.priority", FilterOp.LT, 8))
 
 
 def test_filter_range_op_on_set_field_is_false(unit_factory) -> None:
@@ -260,26 +260,28 @@ def test_filter_range_op_on_set_field_is_false(unit_factory) -> None:
 
 def test_filter_contains_rejects_scalar_even_on_exact_value(unit_factory) -> None:
     unit = unit_factory("a", "x")
-    unit.metadata["project"] = "homework"
+    unit.user_metadata["project"] = "homework"
 
     assert not matches_filters(
-        unit, FilterClause("metadata.project", FilterOp.CONTAINS, "homework")
+        unit, FilterClause("user_metadata.project", FilterOp.CONTAINS, "homework")
     )
-    assert not matches_filters(unit, FilterClause("metadata.project", FilterOp.CONTAINS, "work"))
+    assert not matches_filters(
+        unit, FilterClause("user_metadata.project", FilterOp.CONTAINS, "work")
+    )
 
 
 def test_filter_scalar_ops_do_not_treat_array_as_scalar(unit_factory) -> None:
     unit = unit_factory("a", "x")
-    unit.metadata["project"] = ["alpha", "beta"]
+    unit.user_metadata["project"] = ["alpha", "beta"]
 
-    assert matches_filters(unit, FilterClause("metadata.project", FilterOp.CONTAINS, "alpha"))
-    assert not matches_filters(unit, FilterClause("metadata.project", FilterOp.EQ, "alpha"))
-    assert matches_filters(unit, FilterClause("metadata.project", FilterOp.NE, "alpha"))
+    assert matches_filters(unit, FilterClause("user_metadata.project", FilterOp.CONTAINS, "alpha"))
+    assert not matches_filters(unit, FilterClause("user_metadata.project", FilterOp.EQ, "alpha"))
+    assert matches_filters(unit, FilterClause("user_metadata.project", FilterOp.NE, "alpha"))
     assert not matches_filters(
-        unit, FilterClause("metadata.project", FilterOp.IN, ["alpha", "gamma"])
+        unit, FilterClause("user_metadata.project", FilterOp.IN, ["alpha", "gamma"])
     )
     assert matches_filters(
-        unit, FilterClause("metadata.project", FilterOp.NOT_IN, ["alpha", "gamma"])
+        unit, FilterClause("user_metadata.project", FilterOp.NOT_IN, ["alpha", "gamma"])
     )
 
 
@@ -289,7 +291,7 @@ def test_current_query_excludes_expired_active(unit_factory) -> None:
     lifecycle 与 valid-time 是两套独立的失效机制。状态清扫尚未执行时，这类中间态
     仍不能被当前态查询当作有效。
     """
-    expired = unit_factory("a", "x", t_invalid=datetime.now(timezone.utc) - timedelta(days=1))
+    expired = unit_factory("a", "x", t_invalid=datetime.now(UTC) - timedelta(days=1))
 
     assert expired.lifecycle == LifecycleState.ACTIVE
     assert not passes(expired, None)
@@ -297,14 +299,14 @@ def test_current_query_excludes_expired_active(unit_factory) -> None:
 
 def test_current_query_excludes_not_yet_valid(unit_factory) -> None:
     """t_valid 尚未到达的记忆同样不属于"当前有效"（经 MemoryPatch.t_valid 可设未来）。"""
-    future = unit_factory("a", "x", t_valid=datetime.now(timezone.utc) + timedelta(days=1))
+    future = unit_factory("a", "x", t_valid=datetime.now(UTC) + timedelta(days=1))
 
     assert not passes(future, None)
 
 
 def test_current_query_keeps_active_within_valid_window(unit_factory) -> None:
     """常规活跃记忆不受影响：t_valid 已过、t_invalid 为空或未到。"""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     open_ended = unit_factory("a", "x", t_valid=now - timedelta(days=1))
     later = unit_factory("b", "x", t_valid=now - timedelta(days=1), t_invalid=now + timedelta(1))
 
@@ -321,7 +323,7 @@ def test_explicit_t_invalid_filter_sees_sentinel_not_none(unit_factory) -> None:
     unit = unit_factory("a", "x")
     assert unit.temporal.t_invalid is None
 
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
     assert matches_filters(unit, FilterClause("t_invalid", FilterOp.GT, now_ms))
     assert matches_filters(unit, FilterClause("t_invalid", FilterOp.EQ, T_INVALID_OPEN))
     assert not matches_filters(unit, FilterClause("t_invalid", FilterOp.LT, now_ms))
@@ -331,7 +333,7 @@ def test_valid_at_reads_source_of_truth_not_sentinel(unit_factory) -> None:
     """valid_at 不受哨兵影响——它直接读真源 None，判"永久有效"。"""
     unit = unit_factory("a", "x")
 
-    assert valid_at(unit, datetime(9999, 1, 1, tzinfo=timezone.utc))
+    assert valid_at(unit, datetime(9999, 1, 1, tzinfo=UTC))
 
 
 def test_valid_at_open_ended_interval_is_valid(unit_factory) -> None:
@@ -350,10 +352,10 @@ def test_valid_at_open_ended_interval_is_valid(unit_factory) -> None:
 def test_filter_boolean_metadata(unit_factory) -> None:
     # JSON bool 原生带入，等值过滤直接生效
     unit = unit_factory("a", "x")
-    unit.metadata["archived"] = False
+    unit.user_metadata["archived"] = False
 
-    assert matches_filters(unit, FilterClause("metadata.archived", FilterOp.EQ, False))
-    assert not matches_filters(unit, FilterClause("metadata.archived", FilterOp.EQ, True))
+    assert matches_filters(unit, FilterClause("user_metadata.archived", FilterOp.EQ, False))
+    assert not matches_filters(unit, FilterClause("user_metadata.archived", FilterOp.EQ, True))
 
 
 def test_filter_numeric_predicate_on_system_field_works(unit_factory) -> None:
@@ -371,10 +373,10 @@ def test_filter_none_passes_all(unit_factory) -> None:
 
 def test_filter_metadata_memory_type_uses_canonical_field(unit_factory) -> None:
     unit = unit_factory("a", "x")
-    unit.metadata["memory_type"] = "coding"
+    unit.system_metadata["memory_type"] = "coding"
 
     assert matches_filters(
-        unit, normalize(FilterClause("metadata.memory_type", FilterOp.EQ, "coding"))
+        unit, normalize(FilterClause("system_metadata.memory_type", FilterOp.EQ, "coding"))
     )
     assert matches_filters(unit, normalize(FilterClause("memory_type", FilterOp.EQ, "coding")))
 

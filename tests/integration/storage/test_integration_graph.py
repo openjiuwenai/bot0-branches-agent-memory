@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import pytest
 
-from common.errors import ConflictError, HealthCheckError, NotFoundError
-from common.type_def import Scope
-from storage import StoreType
-from storage.graph import GraphProducer
-from storage.graph_impl.nano_graphrag_graph import NanoGraphRAGGraphStore
-from storage.types import Edge, GraphQuery, Node
+from jiuwen_memory.common.errors import ConflictError, HealthCheckError, NotFoundError
+from jiuwen_memory.common.type_def import Scope
+from jiuwen_memory.storage import StoreType
+from jiuwen_memory.storage.graph import GraphProducer
+from jiuwen_memory.storage.graph_impl.nano_graphrag_graph import NanoGraphRAGGraphStore
+from jiuwen_memory.storage.types import Edge, GraphQuery, Node
 
 SCOPE = Scope(org="itest", user="u1")
 
@@ -182,7 +182,7 @@ def test_graph_persists_across_instances(graph, tmp_path):
         edges=[Edge(id="e1", source="a", target="b", relation="r")],
     )
     # 新实例从同一 working_dir 重新加载
-    reopened = NanoGraphRAGGraphStore(working_dir=getattr(graph, "_working_dir"))
+    reopened = NanoGraphRAGGraphStore(working_dir=getattr(graph, "_fallback_working_dir"))
     assert reopened.get(SCOPE, ["a"])[0].properties == {"k": "v"}
     assert _ids(reopened.search(SCOPE, GraphQuery(start_id="a", relation="r"))) == {"b"}
 

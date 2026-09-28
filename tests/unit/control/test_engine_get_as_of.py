@@ -1,22 +1,32 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
-from api import DeleteMode, DeleteSelector, MemoryPatch, Scope
-from api.memory_api_impl import build_kernel
-from common.errors import NotFoundError
-from common.type_def import MemoryTier, MemoryUnit, Modality, Segment, Temporal, memory_key
-from common.type_def.memory_codec import dumps
+from jiuwen_memory.api import DeleteMode, DeleteSelector, MemoryPatch, Scope
+from jiuwen_memory.api.memory_api_impl.assembly import _build_kernel as build_kernel
+from jiuwen_memory.common.errors import NotFoundError
+from jiuwen_memory.common.security.legacy import legacy_request_context
+from jiuwen_memory.common.type_def import (
+    MemoryTier,
+    MemoryUnit,
+    Modality,
+    Segment,
+    Temporal,
+    memory_key,
+)
+from jiuwen_memory.common.type_def.memory_codec import dumps
+from jiuwen_memory.storage.kv_impl.in_memory_kv_store import InMemoryKVStore
 
 
 def test_get_as_of_returns_version_valid_at_that_time() -> None:
     scope = Scope(org="acme", user="u1", agent="a1", session="s1")
     actor = scope
-    kernel = build_kernel()
-    first_valid = datetime(2026, 6, 17, 10, 0, tzinfo=timezone.utc)
-    second_valid = datetime(2026, 6, 17, 11, 0, tzinfo=timezone.utc)
+    kv = InMemoryKVStore()
+    kernel = build_kernel(kv=kv)
+    first_valid = datetime(2026, 6, 17, 10, 0, tzinfo=UTC)
+    second_valid = datetime(2026, 6, 17, 11, 0, tzinfo=UTC)
     old = MemoryUnit(
         id="home-v1",
         scope=scope,
@@ -32,20 +42,20 @@ def test_get_as_of_returns_version_valid_at_that_time() -> None:
         temporal=Temporal(t_valid=second_valid),
         supersedes=old.id,
     )
-    kernel.kv.insert(scope, memory_key(old.id), dumps(old))
-    kernel.kv.insert(scope, memory_key(new.id), dumps(new))
+    kv.insert(scope, memory_key(old.id), dumps(old))
+    kv.insert(scope, memory_key(new.id), dumps(new))
 
     before_update = kernel.api.get(
         new.id,
         scope,
-        identity=actor,
-        as_of=datetime(2026, 6, 17, 10, 30, tzinfo=timezone.utc),
+        security=legacy_request_context(actor),
+        as_of=datetime(2026, 6, 17, 10, 30, tzinfo=UTC),
     )
     after_update = kernel.api.get(
         old.id,
         scope,
-        identity=actor,
-        as_of=datetime(2026, 6, 17, 11, 30, tzinfo=timezone.utc),
+        security=legacy_request_context(actor),
+        as_of=datetime(2026, 6, 17, 11, 30, tzinfo=UTC),
     )
 
     assert before_update.id == old.id
@@ -57,30 +67,31 @@ def test_get_as_of_returns_version_valid_at_that_time() -> None:
 def test_get_as_of_handles_historical_update_before_original_write_time() -> None:
     scope = Scope(org="acme", user="u1", agent="a1", session="s1")
     actor = scope
-    kernel = build_kernel()
+    kv = InMemoryKVStore()
+    kernel = build_kernel(kv=kv)
 
-    old = kernel.api.write("home is Shanghai", scope, identity=actor)[0]
+    old = kernel.api.add("home is Shanghai", scope, security=legacy_request_context(actor))[0]
     new = kernel.api.update(
         old.id,
         scope,
         MemoryPatch(
             content="home is Beijing",
-            t_valid=datetime(2026, 6, 17, 11, 0, tzinfo=timezone.utc),
+            t_valid=datetime(2026, 6, 17, 11, 0, tzinfo=UTC),
         ),
-        identity=actor,
+        security=legacy_request_context(actor),
     )
 
     before_update = kernel.api.get(
         new.id,
         scope,
-        identity=actor,
-        as_of=datetime(2026, 6, 17, 10, 30, tzinfo=timezone.utc),
+        security=legacy_request_context(actor),
+        as_of=datetime(2026, 6, 17, 10, 30, tzinfo=UTC),
     )
     after_update = kernel.api.get(
         old.id,
         scope,
-        identity=actor,
-        as_of=datetime(2026, 6, 17, 11, 30, tzinfo=timezone.utc),
+        security=legacy_request_context(actor),
+        as_of=datetime(2026, 6, 17, 11, 30, tzinfo=UTC),
     )
 
     assert before_update.id == old.id
@@ -92,9 +103,10 @@ def test_get_as_of_handles_historical_update_before_original_write_time() -> Non
 def test_get_as_of_does_not_return_forgotten_version() -> None:
     scope = Scope(org="acme", user="u1", agent="a1", session="s1")
     actor = scope
-    kernel = build_kernel()
-    old_valid = datetime(2026, 6, 17, 10, 0, tzinfo=timezone.utc)
-    new_valid = datetime(2026, 6, 17, 11, 0, tzinfo=timezone.utc)
+    kv = InMemoryKVStore()
+    kernel = build_kernel(kv=kv)
+    old_valid = datetime(2026, 6, 17, 10, 0, tzinfo=UTC)
+    new_valid = datetime(2026, 6, 17, 11, 0, tzinfo=UTC)
 
     old = MemoryUnit(
         id="home-v1",
@@ -111,17 +123,17 @@ def test_get_as_of_does_not_return_forgotten_version() -> None:
         temporal=Temporal(t_valid=new_valid),
         supersedes=old.id,
     )
-    kernel.kv.insert(scope, memory_key(old.id), dumps(old))
-    kernel.kv.insert(scope, memory_key(new.id), dumps(new))
+    kv.insert(scope, memory_key(old.id), dumps(old))
+    kv.insert(scope, memory_key(new.id), dumps(new))
     kernel.api.delete(
         DeleteSelector(unit_ids=[old.id], scope=scope, mode=DeleteMode.FORGET),
-        identity=actor,
+        security=legacy_request_context(actor),
     )
 
     with pytest.raises(NotFoundError):
         kernel.api.get(
             new.id,
             scope,
-            identity=actor,
-            as_of=datetime(2026, 6, 17, 10, 30, tzinfo=timezone.utc),
+            security=legacy_request_context(actor),
+            as_of=datetime(2026, 6, 17, 10, 30, tzinfo=UTC),
         )

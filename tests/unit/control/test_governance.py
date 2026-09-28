@@ -2,15 +2,33 @@ from __future__ import annotations
 
 import pytest
 
-from api import Scope
-from api.memory_api_impl import build_kernel
-from common.audit.base import AuditLogger
-from common.errors import BackendError
-from common.type_def import AuditEvent, MemoryUnit, Segment, memory_key
-from common.type_def.memory_codec import dumps
-from control.governance_impl.in_memory_governor import InMemoryGovernor
+from jiuwen_memory.api import Scope
+from jiuwen_memory.api.memory_api_impl.assembly import _build_kernel as build_kernel
+from jiuwen_memory.common.audit.base import AuditLogger
+from jiuwen_memory.common.errors import BackendError
+from jiuwen_memory.common.security.legacy import legacy_request_context
+from jiuwen_memory.common.type_def import AuditEvent, MemoryUnit, Segment, memory_key
+from jiuwen_memory.common.type_def.memory_codec import dumps
+from jiuwen_memory.config.config import Config
+from jiuwen_memory.control.governance_impl.in_memory_governor import InMemoryGovernor
+from jiuwen_memory.storage.kv_impl.in_memory_kv_store import InMemoryKVStore
+from jiuwen_memory.storage.store_manager_impl import CompositeStoreManager
 
 pytestmark = pytest.mark.unit
+
+_TEST_KEY_HEX = "00" * 32
+
+
+def _test_kernel():
+    config = Config.from_dict(
+        {
+            "security": {
+                "default": {"target": "local", "params": {"key_hex": _TEST_KEY_HEX}}
+            }
+        }
+    )
+    kv = InMemoryKVStore()
+    return build_kernel(kv=kv, config=config), kv
 
 
 class _QueryOnlyAuditLogger(AuditLogger):
@@ -29,10 +47,14 @@ class _FailingKV:
     def get(scope: Scope, key: str) -> bytes:
         raise BackendError("storage unavailable")
 
+    @staticmethod
+    def mget(scope: Scope, keys: list[str]) -> list[bytes]:
+        raise BackendError("storage unavailable")
+
 
 def test_trace_follows_provenance_sources_depth_first() -> None:
     scope = Scope(user="u1")
-    kernel = build_kernel()
+    kernel, kv = _test_kernel()
     source = MemoryUnit(id="source", scope=scope, segments=[Segment(content="source")])
     direct = MemoryUnit(
         id="direct",
@@ -47,9 +69,12 @@ def test_trace_follows_provenance_sources_depth_first() -> None:
         provenance=["direct"],
     )
     for unit in [source, direct, nested]:
-        kernel.kv.insert(scope, memory_key(unit.id), dumps(unit))
+        kv.insert(scope, memory_key(unit.id), dumps(unit))
 
-    assert [unit.id for unit in kernel.api.trace("nested", scope, identity=scope)] == [
+    assert [
+        unit.id
+        for unit in kernel.api.trace("nested", scope, security=legacy_request_context(scope))
+    ] == [
         "nested",
         "direct",
         "source",
@@ -58,17 +83,19 @@ def test_trace_follows_provenance_sources_depth_first() -> None:
 
 def test_trace_stops_on_provenance_cycles() -> None:
     scope = Scope(user="u1")
-    kernel = build_kernel()
+    kernel, kv = _test_kernel()
     a = MemoryUnit(id="a", scope=scope, segments=[Segment(content="a")], provenance=["b"])
     b = MemoryUnit(id="b", scope=scope, segments=[Segment(content="b")], provenance=["a"])
     for unit in [a, b]:
-        kernel.kv.insert(scope, memory_key(unit.id), dumps(unit))
+        kv.insert(scope, memory_key(unit.id), dumps(unit))
 
-    assert [unit.id for unit in kernel.api.trace("a", scope, identity=scope)] == ["a", "b"]
+    assert [
+        unit.id for unit in kernel.api.trace("a", scope, security=legacy_request_context(scope))
+    ] == ["a", "b"]
 
 
 def test_inspect_is_bound_to_the_authorized_scope() -> None:
-    kernel = build_kernel()
+    kernel, kv = _test_kernel()
     scope_a = Scope(org="acme", space="space-a", user="alice")
     scope_b = Scope(org="acme", space="space-b", user="alice")
     unit_a = MemoryUnit(
@@ -81,24 +108,24 @@ def test_inspect_is_bound_to_the_authorized_scope() -> None:
         scope=scope_b,
         segments=[Segment(content="space B content")],
     )
-    kernel.kv.insert(scope_a, memory_key(unit_a.id), dumps(unit_a))
-    kernel.kv.insert(scope_b, memory_key(unit_b.id), dumps(unit_b))
+    kv.insert(scope_a, memory_key(unit_a.id), dumps(unit_a))
+    kv.insert(scope_b, memory_key(unit_b.id), dumps(unit_b))
 
-    inspected = kernel.api.inspect([unit_b.id], scope_b, identity=scope_b)
+    inspected = kernel.api.inspect([unit_b.id], scope_b, security=legacy_request_context(scope_b))
 
     assert [unit.content for unit in inspected] == ["space B content"]
 
 
 def test_inspect_does_not_hide_storage_failures() -> None:
-    governor = InMemoryGovernor(_FailingKV(), _QueryOnlyAuditLogger([]))
+    governor = InMemoryGovernor(CompositeStoreManager(kv=_FailingKV()), _QueryOnlyAuditLogger([]))
 
     with pytest.raises(BackendError, match="storage unavailable"):
         governor.inspect(["unit-id"], Scope(org="acme"))
 
 
 def test_audit_uses_logger_query_interface() -> None:
-    kernel = build_kernel()
+    kernel, kv = _test_kernel()
     event = AuditEvent(action="write", layer="api")
-    governor = InMemoryGovernor(kernel.kv, _QueryOnlyAuditLogger([event]))
+    governor = InMemoryGovernor(kernel.storage, _QueryOnlyAuditLogger([event]))
 
     assert governor.audit({"action": "write"}, limit=10) == [event]

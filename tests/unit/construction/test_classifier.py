@@ -10,7 +10,7 @@ LLMClassifier 重写为纯 LLM tier+tags 抽取后，测试覆盖：
 
 import json
 
-from common.type_def import (
+from jiuwen_memory.common.type_def import (
     LifecycleState,
     MemoryTier,
     MemoryUnit,
@@ -19,9 +19,9 @@ from common.type_def import (
     Segment,
     Temporal,
 )
-from construction.base import OperatorType
-from construction.classifier_impl.keyword_classifier import KeywordClassifier
-from construction.classifier_impl.llm_classifier import LLMClassifier
+from jiuwen_memory.construction.base import OperatorType
+from jiuwen_memory.construction.classifier_impl.keyword_classifier import KeywordClassifier
+from jiuwen_memory.construction.classifier_impl.llm_classifier import LLMClassifier
 from tests.unit.construction.fixtures import MockLLM
 
 
@@ -32,7 +32,8 @@ def _make_unit(
     tags_override: list[str] | None = None,
     **overrides,
 ) -> MemoryUnit:
-    """构造测试 unit：默认 EPISODIC/ACTIVE，支持 tags_override 与 scope/tier/lifecycle/provenance 覆盖。"""
+    """构造测试 unit：默认 EPISODIC/ACTIVE，支持 tags_override 与
+    scope/tier/lifecycle/provenance 覆盖。"""
     unit = MemoryUnit(
         id=unit_id,
         scope=overrides.get("scope") or Scope(org="test", user="alice"),

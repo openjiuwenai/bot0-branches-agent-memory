@@ -17,18 +17,18 @@ import types
 
 import pytest
 
-import common.lock.lock_impl  # noqa: F401  触发自注册
-from common.errors import BackendError, ValidationError
-from common.lock import (
+import jiuwen_memory.common.lock.lock_impl  # noqa: F401  触发自注册
+from jiuwen_memory.common.errors import BackendError, ValidationError
+from jiuwen_memory.common.lock import (
     KEY_PREFIX,
     LockHandle,
     LockProducer,
     LockTimeoutError,
 )
-from common.lock.lock_impl.in_memory_lock import InMemoryLockProvider
-from common.lock.lock_impl.redis_lock import _RELEASE_LUA, RedisLockProvider
-from common.type_def import Scope
-from config import AssemblyContext
+from jiuwen_memory.common.lock.lock_impl.in_memory_lock import InMemoryLockProvider
+from jiuwen_memory.common.lock.lock_impl.redis_lock import _RELEASE_LUA, RedisLockProvider
+from jiuwen_memory.common.type_def import Scope
+from jiuwen_memory.config import AssemblyContext
 
 pytestmark = pytest.mark.unit
 
@@ -71,7 +71,7 @@ def test_both_implementations_registered() -> None:
 
 
 def test_top_name_is_a_known_config_section() -> None:
-    from common.factory.factory import Factory
+    from jiuwen_memory.common.factory.factory import Factory
 
     assert "lock" in Factory.known_top_names()
 
@@ -361,7 +361,7 @@ def test_guard_without_auto_renew_starts_no_task() -> None:
 class _FakeScript:
     """模拟 redis-py 的 Script 对象；按脚本源码分派到对应的 CAS 语义。"""
 
-    def __init__(self, backing: "_FakeRedis", source: str) -> None:
+    def __init__(self, backing: _FakeRedis, source: str) -> None:
         self._backing = backing
         self._source = source
 

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
-from common.errors import ValidationError
-from common.type_def import (
+from jiuwen_memory.common.errors import ValidationError
+from jiuwen_memory.common.type_def import (
     FilterClause,
     FilterOp,
-    LifecycleState,
     MemoryTier,
     MemoryUnit,
     Modality,
@@ -19,26 +18,34 @@ from common.type_def import (
     Temporal,
     memory_key,
 )
-from common.type_def.memory_codec import dumps, loads
-from construction.base import OperatorType
-from construction.classifier import Classifier
-from construction.evolver import EvolveMode, Evolver, EvolveResult
-from construction.index_builder import IndexBuilder
-from control.base import ControlOperatorType
-from control.engine_impl.cloud_engine import CloudEngine
-from control.jobs import Job, JobFactory, JobType
-from control.jobs_impl.evolve_job import EvolveJobSpec
-from control.jobs_impl.middle_to_long_job import MiddleToLongJobSpec
-from control.lifecycle import LifecycleManager
-from control.pipeline import MemoryPipeline, PipelineBinding
-from control.scheduler_impl.in_process_scheduler import InProcessScheduler
-from control.types import BatchWriteItem, Channel, DeleteSelector, JobStatus, MemoryPatch, UpdateMode
-from ingest.base import IngestOperatorType
-from ingest.ingestor import Ingestor
-from retrieval.base import RetrievalOperatorType
-from retrieval.retriever import Retriever
-from retrieval.types import RetrievalQuery, RetrievalResult, RetrievedItem
-from storage.kv_impl.in_memory_kv_store import InMemoryKVStore
+from jiuwen_memory.common.type_def.memory_codec import dumps, loads
+from jiuwen_memory.construction.base import OperatorType
+from jiuwen_memory.construction.classifier import Classifier
+from jiuwen_memory.construction.evolver import EvolveMode, Evolver, EvolveResult
+from jiuwen_memory.construction.index_builder import IndexBuilder
+from jiuwen_memory.control.base import ControlOperatorType
+from jiuwen_memory.control.engine_impl.cloud_engine import CloudEngine
+from jiuwen_memory.control.jobs import Job, JobFactory, JobType
+from jiuwen_memory.control.jobs_impl.evolve_job import EvolveJobSpec
+from jiuwen_memory.control.jobs_impl.middle_to_long_job import MiddleToLongJobSpec
+from jiuwen_memory.control.lifecycle import LifecycleManager, SweepTransition
+from jiuwen_memory.control.pipeline import MemoryPipeline, PipelineBinding
+from jiuwen_memory.control.scheduler_impl.in_process_scheduler import InProcessScheduler
+from jiuwen_memory.control.types import (
+    BatchWriteItem,
+    Channel,
+    DeleteSelector,
+    MemoryPatch,
+    UpdateMode,
+)
+from jiuwen_memory.ingest.base import IngestOperatorType
+from jiuwen_memory.ingest.ingestor import Ingestor
+from jiuwen_memory.retrieval.base import RetrievalOperatorType
+from jiuwen_memory.retrieval.retriever import Retriever
+from jiuwen_memory.retrieval.types import RetrievalQuery, RetrievalResult, RetrievedItem
+from jiuwen_memory.storage.kv_impl.in_memory_kv_store import InMemoryKVStore
+from jiuwen_memory.storage.types import IndexRemoveMode, IndexWriteMode
+from tests.conftest import make_storage
 
 pytestmark = pytest.mark.unit
 
@@ -52,7 +59,7 @@ class _RecordingIngestor(Ingestor):
 
     def ingest(self, payloads: list[RawPayload]) -> list[MemoryUnit]:
         units: list[MemoryUnit] = []
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for payload in payloads:
             units.append(
                 MemoryUnit(
@@ -69,18 +76,56 @@ class _RecordingIngestor(Ingestor):
                         t_ingest=now,
                         t_valid=now,
                     ),
-                    metadata=dict(payload.metadata),
+                    system_metadata=dict(payload.system_metadata),
+                    user_metadata=dict(payload.user_metadata),
                 )
             )
         return units
 
 
+class _AssetRoutingIngestor(Ingestor):
+    """把资产映射到第二个 Segment，用于验证 Engine 不解释映射关系。"""
+
+    def __init__(self) -> None:
+        self.received_assets: list[list[str]] = []
+
+    @staticmethod
+    def operator_type() -> IngestOperatorType:
+        return IngestOperatorType.INGESTOR
+
+    @staticmethod
+    def health() -> None:
+        return None
+
+    def ingest(self, payloads: list[RawPayload]) -> list[MemoryUnit]:
+        self.received_assets.extend(list(payload.assets) for payload in payloads)
+        return [
+            MemoryUnit(
+                id=payload.id,
+                scope=payload.scope,
+                segments=[
+                    Segment(content=payload.data.decode("utf-8"), source=payload.modality),
+                    Segment(assets=list(payload.assets), source=payload.modality),
+                ],
+                system_metadata=dict(payload.system_metadata),
+                user_metadata=dict(payload.user_metadata),
+            )
+            for payload in payloads
+        ]
+
+
 class _RecordingIndexBuilder(IndexBuilder):
-    def __init__(self, name: str) -> None:
+    """记录调用并交付真源的替身——IndexBuilder 是记忆写入的唯一入口。
+
+    交付走 KV 直写（``memory_key`` + ``dumps``，ForwardIndexBuilder 模式）。
+    """
+
+    def __init__(self, name: str, kv=None) -> None:
         self.name = name
         self.built: list[str] = []
         self.updated: list[str] = []
         self.removed: list[str] = []
+        self._kv = kv
 
     def operator_type(self) -> OperatorType:
         return OperatorType.INDEX_BUILDER
@@ -88,14 +133,30 @@ class _RecordingIndexBuilder(IndexBuilder):
     def health(self) -> None:
         return None
 
-    def build(self, units: list[MemoryUnit]) -> None:
+    def build(
+        self, units: list[MemoryUnit], *, mode: IndexWriteMode = IndexWriteMode.ALL
+    ) -> None:
         self.built.extend(unit.content for unit in units)
+        # 遵守契约：mode=RETRIEVAL_ONLY 表示本体已存在、只补建派生索引，不得再写本体。
+        if mode is not IndexWriteMode.RETRIEVAL_ONLY and self._kv is not None:
+            for unit in units:
+                self._kv.insert(unit.scope, memory_key(unit.id), dumps(unit))
 
-    def update(self, units: list[MemoryUnit]) -> None:
+    def update(
+        self, units: list[MemoryUnit], *, mode: IndexWriteMode = IndexWriteMode.ALL
+    ) -> None:
         self.updated.extend(unit.id for unit in units)
+        if self._kv is not None:
+            for unit in units:
+                self._kv.update(unit.scope, memory_key(unit.id), dumps(unit))
 
-    def remove(self, units: list[MemoryUnit]) -> None:
+    def remove(
+        self, units: list[MemoryUnit], *, mode: IndexRemoveMode = IndexRemoveMode.HARD
+    ) -> None:
         self.removed.extend(unit.id for unit in units)
+        if mode is IndexRemoveMode.HARD and self._kv is not None:
+            for unit in units:
+                self._kv.delete(unit.scope, memory_key(unit.id))
 
     def rebuild(self) -> None:
         return None
@@ -114,7 +175,7 @@ class _RecordingClassifier(Classifier):
 
     def classify(self, units: list[MemoryUnit]) -> list[MemoryUnit]:
         for unit in units:
-            unit.metadata["classified_by"] = self.name
+            unit.system_metadata["classified_by"] = self.name
             self.classified.append(unit.content)
         return units
 
@@ -123,6 +184,7 @@ class _RecordingRetriever(Retriever):
     def __init__(self, name: str) -> None:
         self.name = name
         self.queries: list[str] = []
+        self.extensions: list[dict] = []
 
     def operator_type(self) -> RetrievalOperatorType:
         return RetrievalOperatorType.RETRIEVER
@@ -132,6 +194,7 @@ class _RecordingRetriever(Retriever):
 
     def retrieve(self, scope: Scope, query: RetrievalQuery) -> RetrievalResult:
         self.queries.append(query.extensions.get("message_type", ""))
+        self.extensions.append(query.extensions)
         return RetrievalResult(items=[RetrievedItem(unit_id=self.name, content=query.text)])
 
 
@@ -157,7 +220,8 @@ class _RecordingEvolver(Evolver):
                 segments=[Segment(content=f"derived:{unit.content}", source=unit.source)],
                 temporal=unit.temporal,
                 provenance=[unit.id],
-                metadata=dict(unit.metadata),
+                system_metadata=dict(unit.system_metadata),
+                user_metadata=dict(unit.user_metadata),
             )
             self.kv.insert(unit.scope, memory_key(derived.id), dumps(derived))
             created_ids.append(derived.id)
@@ -174,6 +238,26 @@ class _RecordingKVStore(InMemoryKVStore):
         return super().list(scope, **kwargs)
 
 
+class _RecordingDomainStore:
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+        self.get_calls = []
+        self.list_calls = []
+        self.scopes_calls = 0
+
+    def get(self, scope, unit_ids):
+        self.get_calls.append((scope, unit_ids))
+        return self._delegate.get(scope, unit_ids)
+
+    def list(self, scope, **kwargs):
+        self.list_calls.append((scope, kwargs))
+        return self._delegate.list(scope, **kwargs)
+
+    def scopes(self):
+        self.scopes_calls += 1
+        return self._delegate.scopes()
+
+
 class _NoopLifecycle(LifecycleManager):
     def operator_type(self) -> ControlOperatorType:
         return ControlOperatorType.LIFECYCLE
@@ -187,7 +271,7 @@ class _NoopLifecycle(LifecycleManager):
     def supersede(self, scope, unit_id, invalid_at):
         raise AssertionError("not used in these tests")
 
-    def sweep(self):
+    def sweep(self) -> list[SweepTransition]:
         return []
 
 
@@ -215,9 +299,9 @@ def _build_test_job_factory(
     与 InMemoryEngine 测试同模式——Spec 装配期固化依赖与业务参数，
     运行时 get_job 补 scope + 运行时参数生成完整 Job 实例。
     """
-    from common.llm.base import LLM
-    from common.base import PluginType
-    from common.type_def.chat import ChatMessage
+    from jiuwen_memory.common.base import PluginType
+    from jiuwen_memory.common.llm.base import LLM
+    from jiuwen_memory.common.type_def.chat import ChatMessage
 
     class _EchoLLM(LLM):
         def plugin_type(self) -> PluginType:
@@ -261,7 +345,7 @@ class _MessageTypePipeline(MemoryPipeline):
         return None
 
     def select_for_write(self, units: list[MemoryUnit]) -> PipelineBinding:
-        route = units[0].metadata.get("message_type", "chat")
+        route = units[0].system_metadata.get("message_type", "chat")
         return self.profiles.get(route, self.profiles["chat"])
 
     def select_for_recall(self, query: RetrievalQuery) -> PipelineBinding:
@@ -269,10 +353,11 @@ class _MessageTypePipeline(MemoryPipeline):
         return self.profiles.get(route, self.profiles["chat"])
 
 
-def _engine():
+def _engine(ingestor: Ingestor | None = None):
     kv = _RecordingKVStore()
-    chat_index = _RecordingIndexBuilder("chat")
-    coding_index = _RecordingIndexBuilder("coding")
+    domain_store = _RecordingDomainStore(make_storage(kv=kv).domain_store())
+    chat_index = _RecordingIndexBuilder("chat", kv)
+    coding_index = _RecordingIndexBuilder("coding", kv)
     chat_classifier = _RecordingClassifier("chat")
     coding_classifier = _RecordingClassifier("coding")
     chat_retriever = _RecordingRetriever("chat")
@@ -297,10 +382,10 @@ def _engine():
     }
     return (
         CloudEngine(
-            ingestor=_RecordingIngestor(),
+            ingestor=ingestor or _RecordingIngestor(),
             index_builder=chat_index,
             retriever=chat_retriever,
-            kv=kv,
+            domain_store=domain_store,
             scheduler=InProcessScheduler(),
             evolver=chat_evolver,
             lifecycle=_NoopLifecycle(),
@@ -311,6 +396,7 @@ def _engine():
         ),
         {
             "kv": kv,
+            "domain_store": domain_store,
             "chat_index": chat_index,
             "coding_index": coding_index,
             "chat_classifier": chat_classifier,
@@ -323,6 +409,24 @@ def _engine():
     )
 
 
+def test_cloud_engine_delegates_assets_mapping_to_ingestor() -> None:
+    ingestor = _AssetRoutingIngestor()
+    engine, _ = _engine(ingestor)
+    assets = ["file:///video.mp4", "file:///transcript.json"]
+
+    units = asyncio.run(
+        engine.write(
+            "normalized content",
+            Scope(org="acme", user="alice"),
+            assets=assets,
+        )
+    )
+
+    assert ingestor.received_assets == [assets]
+    assert units[0].segments[0].assets == []
+    assert units[0].segments[1].assets == assets
+
+
 def test_cloud_engine_write_routes_by_message_type_and_stamps_metadata() -> None:
     engine, records = _engine()
     scope = Scope(org="acme", user="alice")
@@ -332,16 +436,16 @@ def test_cloud_engine_write_routes_by_message_type_and_stamps_metadata() -> None
             "use pytest for this repo",
             scope,
             source=Modality.CODE,
-            metadata={"message_type": "coding", "memory_type": "procedural"},
+            system_metadata={"message_type": "coding", "memory_type": "procedural"},
         )
     )
 
     assert records["chat_index"].built == []
     assert records["coding_index"].built == ["use pytest for this repo"]
     assert records["coding_classifier"].classified == ["use pytest for this repo"]
-    assert units[0].metadata["message_type"] == "coding"
-    assert units[0].metadata["pipeline"] == "coding"
-    assert units[0].metadata["classified_by"] == "coding"
+    assert units[0].system_metadata["message_type"] == "coding"
+    assert units[0].system_metadata["pipeline"] == "coding"
+    assert units[0].system_metadata["classified_by"] == "coding"
 
     context = asyncio.run(engine.permission_context_for_unit(units[0].id, scope))
 
@@ -358,8 +462,8 @@ def test_cloud_engine_write_defaults_to_chat_message_type() -> None:
 
     assert records["chat_index"].built == ["remember my meeting notes"]
     assert records["coding_index"].built == []
-    assert units[0].metadata["message_type"] == "chat"
-    assert units[0].metadata["pipeline"] == "chat"
+    assert units[0].system_metadata["message_type"] == "chat"
+    assert units[0].system_metadata["pipeline"] == "chat"
 
 
 def test_cloud_engine_batch_write_preserves_order_and_routes_each_item() -> None:
@@ -374,7 +478,7 @@ def test_cloud_engine_batch_write_preserves_order_and_routes_each_item() -> None
                     content="coding note",
                     scope=scope,
                     source=Modality.CODE,
-                    metadata={"message_type": "coding"},
+                    system_metadata={"message_type": "coding"},
                 ),
             ]
         )
@@ -383,7 +487,7 @@ def test_cloud_engine_batch_write_preserves_order_and_routes_each_item() -> None
     assert [outcome.units[0].content for outcome in result.outcomes] == ["chat note", "coding note"]
     assert records["chat_index"].built == ["chat note"]
     assert records["coding_index"].built == ["coding note"]
-    assert result.outcomes[1].units[0].metadata["pipeline"] == "coding"
+    assert result.outcomes[1].units[0].system_metadata["pipeline"] == "coding"
 
 
 def test_cloud_engine_batch_write_collects_unexpected_error_and_skips_after_failure() -> None:
@@ -396,7 +500,10 @@ def test_cloud_engine_batch_write_collects_unexpected_error_and_skips_after_fail
     engine.write = _raise_unexpected  # type: ignore[method-assign]
     result = asyncio.run(
         engine.batch_write(
-            [BatchWriteItem(content="first", scope=scope), BatchWriteItem(content="second", scope=scope)],
+            [
+                BatchWriteItem(content="first", scope=scope),
+                BatchWriteItem(content="second", scope=scope),
+            ],
             continue_on_error=False,
         )
     )
@@ -418,6 +525,24 @@ def test_cloud_engine_recall_routes_by_message_type_extension() -> None:
     assert records["chat_retriever"].queries == []
 
 
+def test_cloud_engine_recall_keeps_runtime_extension_identity() -> None:
+    engine, records = _engine()
+    scope = Scope(org="acme", user="alice")
+    marker = object()
+
+    result = asyncio.run(
+        engine.recall(
+            scope,
+            RetrievalQuery(text="testing", extensions={"db_query_service": marker}),
+        )
+    )
+
+    assert result.items
+    routed = records["chat_retriever"]
+    assert routed.queries == ["chat"]
+    assert routed.extensions[0]["db_query_service"] is marker
+
+
 def test_cloud_engine_list_forwards_query_and_returns_total_count() -> None:
     engine, records = _engine()
     scope = Scope(org="acme", space="coding", user="alice")
@@ -425,24 +550,27 @@ def test_cloud_engine_list_forwards_query_and_returns_total_count() -> None:
         engine.write(
             "first alpha memory",
             scope,
-            metadata={"memory_type": "coding", "project": "alpha"},
+            system_metadata={"memory_type": "coding"},
+            user_metadata={"project": "alpha"},
         )
     )[0]
     second = asyncio.run(
         engine.write(
             "second alpha memory",
             scope,
-            metadata={"memory_type": "coding", "project": "alpha"},
+            system_metadata={"memory_type": "coding"},
+            user_metadata={"project": "alpha"},
         )
     )[0]
     asyncio.run(
         engine.write(
             "beta memory",
             scope,
-            metadata={"memory_type": "coding", "project": "beta"},
+            system_metadata={"memory_type": "coding"},
+            user_metadata={"project": "beta"},
         )
     )
-    filters = FilterClause("metadata.project", FilterOp.EQ, "alpha")
+    filters = FilterClause("user_metadata.project", FilterOp.EQ, "alpha")
     extensions = {"vendor_mode": "strict"}
 
     result = asyncio.run(
@@ -459,7 +587,7 @@ def test_cloud_engine_list_forwards_query_and_returns_total_count() -> None:
     assert result.count == 2
     assert len(result.items) == 1
     assert result.items[0].id in {first.id, second.id}
-    call_scope, call_options = records["kv"].list_calls[0]
+    call_scope, call_options = records["domain_store"].list_calls[0]
     assert call_scope == scope
     assert call_options["offset"] == 1
     assert call_options["limit"] == 1
@@ -476,7 +604,7 @@ def test_cloud_engine_infer_uses_profile_evolver_and_returns_derived_units() -> 
         engine.write(
             "extract coding preference",
             scope,
-            metadata={"message_type": "coding", "infer": "true"},
+            system_metadata={"message_type": "coding", "infer": "true"},
         )
     )
 
@@ -484,8 +612,8 @@ def test_cloud_engine_infer_uses_profile_evolver_and_returns_derived_units() -> 
     assert records["chat_evolver"].calls == []
     assert units[0].id == "coding-derived-0"
     assert units[0].content == "derived:extract coding preference"
-    assert units[0].metadata["pipeline"] == "coding"
-    assert units[0].metadata["message_type"] == "coding"
+    assert units[0].system_metadata["pipeline"] == "coding"
+    assert units[0].system_metadata["message_type"] == "coding"
 
 
 def test_cloud_engine_overwrite_moves_unit_between_profile_indexes() -> None:
@@ -499,15 +627,15 @@ def test_cloud_engine_overwrite_moves_unit_between_profile_indexes() -> None:
             scope,
             MemoryPatch(
                 content="coding note",
-                metadata={"message_type": "coding"},
+                system_metadata={"message_type": "coding"},
                 mode=UpdateMode.OVERWRITE,
             ),
         )
     )
 
     assert updated.id == units[0].id
-    assert updated.metadata["message_type"] == "coding"
-    assert updated.metadata["pipeline"] == "coding"
+    assert updated.system_metadata["message_type"] == "coding"
+    assert updated.system_metadata["pipeline"] == "coding"
     assert records["chat_index"].removed == [units[0].id]
     assert records["coding_index"].built == ["coding note"]
 
@@ -528,7 +656,6 @@ def test_cloud_engine_delete_rejects_empty_selector() -> None:
 
 def _engine_with_job_factory(
     *,
-    middle_interval: int = 50,
     with_job_factory: bool = True,
 ):
     """构造带 JobFactory 的 CloudEngine——多 profile binding（chat/coding）。
@@ -538,8 +665,8 @@ def _engine_with_job_factory(
     job._evolver / job._index 为 binding 选的——这是测试要验证的关键点。
     """
     kv = InMemoryKVStore()
-    chat_index = _RecordingIndexBuilder("chat")
-    coding_index = _RecordingIndexBuilder("coding")
+    chat_index = _RecordingIndexBuilder("chat", kv)
+    coding_index = _RecordingIndexBuilder("coding", kv)
     chat_evolver = _RecordingEvolver("chat", kv)
     coding_evolver = _RecordingEvolver("coding", kv)
     lifecycle = _NoopLifecycle()
@@ -560,12 +687,16 @@ def _engine_with_job_factory(
             classifier=_RecordingClassifier("coding"),
         ),
     }
-    factory = _build_test_job_factory(kv, chat_evolver, lifecycle, chat_index) if with_job_factory else None
+    factory = (
+        _build_test_job_factory(kv, chat_evolver, lifecycle, chat_index)
+        if with_job_factory
+        else None
+    )
     engine = CloudEngine(
         ingestor=_RecordingIngestor(),
         index_builder=chat_index,
         retriever=_RecordingRetriever("chat"),
-        kv=kv,
+        domain_store=make_storage(kv=kv).domain_store(),
         scheduler=scheduler,
         evolver=chat_evolver,
         lifecycle=lifecycle,
@@ -574,7 +705,6 @@ def _engine_with_job_factory(
         default_message_type="chat",
         default_pipeline_name="chat",
         job_factory=factory,
-        middle_interval=middle_interval,
     )
     return engine, scheduler, {
         "kv": kv,
@@ -592,7 +722,7 @@ def test_cloud_engine_write_middle_submits_middle_to_long_job() -> None:
     验证：
     - scheduler 收到 MiddleToLongJob（type 名匹配）；
     - job.scope == scope；
-    - job.interval == middle_interval（50）；
+    - job.interval == 50（metadata 未传 middle_interval，回退 Spec 装配期默认）；
     - 原文落盘 tier=WORKING + metadata.middle=true；
     - 立即建索引（index.build 已调）；
     - job._evolver / job._index 被 binding 选的覆盖（coding profile）。
@@ -604,7 +734,7 @@ def test_cloud_engine_write_middle_submits_middle_to_long_job() -> None:
         engine.write(
             "alice likes tea",
             scope,
-            metadata={"message_type": "coding", "infer": "true", "middle": "true"},
+            system_metadata={"message_type": "coding", "infer": "true", "middle": "true"},
         )
     )
 
@@ -618,7 +748,7 @@ def test_cloud_engine_write_middle_submits_middle_to_long_job() -> None:
     assert len(units) >= 1
     persisted = loads(records["kv"].get(scope, memory_key(units[0].id)))
     assert persisted.tier == MemoryTier.WORKING
-    assert persisted.metadata.get("middle") == "true"
+    assert persisted.system_metadata.get("middle") == "true"
     # 立即建索引（coding_index 收到 build）
     assert records["coding_index"].built == ["alice likes tea"]
     # job._evolver / job._index 被 binding 的覆盖——
@@ -638,9 +768,39 @@ def test_cloud_engine_write_middle_raises_when_job_factory_is_none() -> None:
             engine.write(
                 "x",
                 scope,
-                metadata={"message_type": "chat", "infer": "true", "middle": "true"},
+                system_metadata={"message_type": "chat", "infer": "true", "middle": "true"},
             )
         )
+
+
+@pytest.mark.parametrize(
+    "middle_interval",
+    ["abc", "0", "-1"],
+)
+def test_cloud_engine_write_middle_invalid_interval_raises_before_persist(
+    middle_interval: str,
+) -> None:
+    """非法 middle_interval 在落盘前 fail fast，不残留 KV/索引/Job（Refs #182）。"""
+    engine, scheduler, records = _engine_with_job_factory()
+    scope = Scope(org="acme", user="alice")
+
+    with pytest.raises(ValidationError, match=r"middle_interval"):
+        asyncio.run(
+            engine.write(
+                "oscar likes pottery",
+                scope,
+                system_metadata={
+                    "message_type": "chat",
+                    "infer": "true",
+                    "middle": "true",
+                    "middle_interval": middle_interval,
+                },
+            )
+        )
+
+    assert scheduler.calls == []
+    assert records["chat_index"].built == []
+    assert records["kv"].list(scope, limit=100).entries == []
 
 
 def test_cloud_engine_procedural_takes_precedence_over_middle() -> None:
@@ -656,7 +816,7 @@ def test_cloud_engine_procedural_takes_precedence_over_middle() -> None:
         engine.write(
             "alice likes tea",
             scope,
-            metadata={"message_type": "chat", "procedural": "true", "middle": "true"},
+            system_metadata={"message_type": "chat", "procedural": "true", "middle": "true"},
         )
     )
 
@@ -683,7 +843,8 @@ def test_cloud_engine_evolve_submits_evolve_job_via_job_factory() -> None:
     assert channel == Channel.HOT
     assert job.scope == scope
     assert job.interval == 0  # EvolveJob 是一次性任务
-    assert job._mode == EvolveMode.CONSOLIDATE  # mode 经构造参数流入  # pylint: disable=protected-access
+    # mode 经构造参数流入。
+    assert job._mode == EvolveMode.CONSOLIDATE  # pylint: disable=protected-access
 
 
 def test_cloud_engine_evolve_raises_when_job_factory_is_none() -> None:

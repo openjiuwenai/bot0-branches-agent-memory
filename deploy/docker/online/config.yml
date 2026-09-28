@@ -10,6 +10,13 @@ memory_api:
     vector_enabled: true
     graph_enabled: false
     rerank_enabled: true
+    entity_enabled: false       # Entity-linked memory master switch: write side (HybridIndexBuilder)
+                                # builds the entity reverse index; recall side (KeywordRecaller) takes
+                                # the manager's ENTITY port for L2 entity expansion. Set true to enable;
+                                # false skips both consumers (the port is still assembled and joins
+                                # health; drop the entity_store section below to skip assembly too).
+                                # Default off — full pipeline also needs unit.entities plaintext filled
+                                # (LLM extraction upstream).
 
     # bge-m3 dense dimension. Must match the Milvus collection dim.
     embedder_dim: 1024
@@ -145,7 +152,56 @@ memory_api:
         ssl_verify: "${MILVUS_SSL_VERIFY:-false}"
         ssl_ca_cert: "${MILVUS_SSL_CA:-}"
 
-  # Keep query text unchanged: the chat LLM is not used for query rewriting.
+  # ---- Entity reverse index (ES; the StoreManager ENTITY port = 7th StorageCapability).
+  # Ports are aggregated from their namespaces (declare = expose): declaring default here
+  # therefore makes it the manager's ENTITY default port; do NOT add a store_manager
+  # section for this — instance-level override replaces defaults.py's
+  # store_manager.default.params wholesale (including the whole domain_stores section:
+  # preferred retrieval pipeline, the kv_store source-of-truth port and every *_recaller
+  # selector key), and a missed key silently drops a recall channel.
+  # ES builder returns None when hosts unset → no ENTITY capability → both sides degrade
+  # off automatically (no error). Once declared and constructed, this port joins
+  # manager.health() aggregation: an unreachable entity ES makes health fail (write/recall
+  # main paths are unaffected — both sides keep their try/except guards).
+  # entity_text plaintext is never persisted (sha256 hash only); can share the same ES
+  # cluster with fulltext_store but lands in a separate index.
+  entity_store:
+    default:
+      target: elasticsearch
+      params:
+        hosts: "${ES_HOSTS:-http://elasticsearch:9200}"
+        index: "${ES_ENTITY_INDEX:-memory_entities}"
+        # entity index uses space_id as ES routing (forces _routing.required); does not use
+        # fulltext analyzer (exact hash match, no token analysis). SSL mirrors fulltext_store.
+        ssl_verify: "${ES_SSL_VERIFY:-false}"
+        ssl_ca_cert: "${ES_SSL_CA:-}"
+
+  # constructor (index_builder): instance-level override replaces default params wholesale,
+  # so chunker/embedder must all be restated.
+  constructor:
+    default:
+      target: hybrid
+      params:
+        chunker: default
+        embedder: default
+        # ENTITY port selection key: the value is a manager port name (not a Producer
+        # reference); read from params only (no globals fallback), defaults to "default".
+        # Whether the entity chain runs is governed separately by globals.entity_enabled.
+        # Both sides take the same port off the same manager — instance sharing is
+        # guaranteed by the manager, not by config discipline.
+        entity_store: default
+
+  # recaller.keyword named instance: instance-level override replaces default recaller.keyword
+  # params wholesale.
+  recaller:
+    keyword:
+      target: keyword
+      params:
+        entity_store: default      # same ENTITY port selection key (recall-side L2 expansion)
+    # keyword_l0/keyword_l1/vector* retain defaults.py defaults (not restated here to avoid
+    # wholesale-replace field loss)
+
+  # Keep query text unchanged: rewrite_enabled controls LLM rewriting (default off).
   query_parser:
     default:
       target: simple
@@ -153,3 +209,4 @@ memory_api:
         tokenizer: default
         embedder: default
         llm: { target: echo }
+        rewrite_enabled: false

@@ -8,10 +8,12 @@
 - remove 幂等删 L0/L1 record。
 """
 
-from common.type_def import ContentLayers, Scope
-from construction.index_builder_impl.fulltext_index_builder import FulltextIndexBuilder
-from construction.index_builder_impl.vector_index_builder import VectorIndexBuilder
-
+from jiuwen_memory.common.type_def import ContentLayers, Scope
+from jiuwen_memory.construction.index_builder_impl.fulltext_index_builder import (
+    FulltextIndexBuilder,
+)
+from jiuwen_memory.construction.index_builder_impl.vector_index_builder import VectorIndexBuilder
+from jiuwen_memory.storage.store_manager_impl import CompositeStoreManager
 from tests.unit.construction.fixtures import (
     MemoryFulltextStore,
     MemoryVectorStore,
@@ -19,7 +21,6 @@ from tests.unit.construction.fixtures import (
     create_test_stores,
     create_test_unit,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -40,12 +41,16 @@ def _make_layered_vector_builder():
     vector_l0 = MemoryVectorStore()
     vector_l1 = MemoryVectorStore()
     builder = VectorIndexBuilder(
-        vector_store=stores["vector"],
-        kv_store=stores["kv"],
+        CompositeStoreManager(
+            kv=stores["kv"],
+            vector={
+                "default": stores["vector"],
+                "layers_l0": vector_l0,
+                "layers_l1": vector_l1,
+            },
+        ),
         chunker=plugins["chunker"],
         embedder=plugins["embedder"],
-        vector_l0=vector_l0,
-        vector_l1=vector_l1,
     )
     return builder, stores, vector_l0, vector_l1, plugins
 
@@ -56,9 +61,13 @@ def _make_layered_fulltext_builder():
     fulltext_l0 = MemoryFulltextStore()
     fulltext_l1 = MemoryFulltextStore()
     builder = FulltextIndexBuilder(
-        store=stores["fulltext"],
-        fulltext_l0=fulltext_l0,
-        fulltext_l1=fulltext_l1,
+        CompositeStoreManager(
+            fulltext={
+                "default": stores["fulltext"],
+                "layers_l0": fulltext_l0,
+                "layers_l1": fulltext_l1,
+            },
+        )
     )
     return builder, stores, fulltext_l0, fulltext_l1
 
@@ -100,8 +109,7 @@ def test_vector_layers_skipped_when_store_none():
     stores = create_test_stores()
     plugins = create_test_plugins()
     builder = VectorIndexBuilder(  # 不传 vector_l0/vector_l1 → None
-        vector_store=stores["vector"],
-        kv_store=stores["kv"],
+        CompositeStoreManager(kv=stores["kv"], vector=stores["vector"]),
         chunker=plugins["chunker"],
         embedder=plugins["embedder"],
     )
@@ -119,12 +127,12 @@ def test_vector_layers_partial_injection():
     plugins = create_test_plugins()
     vector_l0 = MemoryVectorStore()  # 只配 L0
     builder = VectorIndexBuilder(
-        vector_store=stores["vector"],
-        kv_store=stores["kv"],
+        CompositeStoreManager(
+            kv=stores["kv"],
+            vector={"default": stores["vector"], "layers_l0": vector_l0},
+        ),
         chunker=plugins["chunker"],
         embedder=plugins["embedder"],
-        vector_l0=vector_l0,
-        # vector_l1 不传 → None
     )
     scope = Scope(org="test", user="alice")
     unit = _unit_with_layers("u1", "内容", l0="概要", l1="要点")
@@ -193,7 +201,7 @@ def test_fulltext_layers_built_into_separate_stores():
 def test_fulltext_layers_skipped_when_store_none():
     """L0/L1 store 为 None → 跳过该层不报错。"""
     stores = create_test_stores()
-    builder = FulltextIndexBuilder(store=stores["fulltext"])  # 不传 L0/L1
+    builder = FulltextIndexBuilder(CompositeStoreManager(fulltext=stores["fulltext"]))
     scope = Scope(org="test", user="alice")
     unit = _unit_with_layers("u1", "内容", l0="概要", l1="要点")
     builder.build([unit])  # 不抛异常

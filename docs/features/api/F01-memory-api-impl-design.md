@@ -1,33 +1,35 @@
-# F01 — 记忆接口层实现规约（src/api/memory_api_impl）
+# F01 — 记忆接口层实现规约（jiuwen_memory/api/memory_api_impl）
 
 ## 元信息
 
 | 项 | 值 |
 |---|---|
-| 日期 | 2026-06-24 |
-| 影响范围 | src/api/，src/control/，src/storage/，src/common/type_def/，bootstrap/core/handler.py，docs/specs/S02-memory-api.md，docs/specs/S03-control.md，docs/specs/S06-storage.md，docs/specs/S07-common.md |
-| 测试基线 | list 相关 API/handler/Engine/KV/common/retrieval 单测通过；ruff、compileall 与 `git diff --check` 通过；完整 `tests/unit` 仅两项因环境缺少 torch 失败 |
+| 日期 | 2026-09-05 |
+| 影响范围 | jiuwen_memory/api/，jiuwen_memory/control/，jiuwen_memory/storage/，jiuwen_memory/common/type_def/，jiuwen_memory_entry/，docs/specs/S02-memory-api.md，docs/specs/S03-control.md，docs/specs/S06-storage.md，docs/specs/S07-common.md |
+| 测试基线 | 历史基线：API/handler/HTTP 专项通过；完整 `tests/unit` 除两个 entity logger caplog 用例外通过。当前 HTTP 评审修补与契约测试更名后的验证结果见 [F05](F05-http-memory-api-alignment.md#验证) |
 | Refs | —（如有 issue 补 `Refs: #<n>`） |
 
-> 本文档归档**记忆接口层实现的设计与取舍**：`MemoryAPI` 的单进程实现 `LocalMemoryAPI`（鉴权/审计执行点）与装配落点 `assembly.py`（`build_kernel`/`assemble`/`Kernel`）。
-> `MemoryAPI` 的**公开方法签名 / 参数语义 / 返回类型**以接口 `src/api/memory_api.py` 为准（归 spec/接口源码），本文不重复罗列签名，只记录「为什么这样实现」。
+> 本文档归档**记忆接口层实现的设计与取舍**：`MemoryAPI` 的单进程实现 `LocalMemoryAPI`（鉴权/审计执行点）与装配落点 `assembly.py`（公开 `assemble` / `assemble_runtime`，内部 `_build_kernel` / `_Kernel`）。
+> `MemoryAPI` 的**公开方法签名 / 参数语义 / 返回类型**以接口 `jiuwen_memory/api/memory_api.py` 与 [S02](../../specs/S02-memory-api.md) 为准，本文不重复罗列签名，只记录「为什么这样实现」。
 
 ---
 
 ## 背景
 
-`MemoryAPI`（`src/api/memory_api.py`）是内核的**唯一对外入口**，形态无关——SDK/CLI/Skill/MCP/HTTP·gRPC 各接入形态最终都映射到这同一组语义。调用层只依赖 `api` 这一个包即可触达全部能力与所需类型，无需 import 内核其他包：
+`MemoryAPI`（`jiuwen_memory/api/memory_api.py`）是内核的**唯一对外入口**，形态无关——SDK/CLI/Skill/MCP/HTTP·gRPC 各接入形态最终都映射到这同一组语义。调用层只依赖 `api` 这一个包即可触达全部能力与所需类型，无需 import 内核其他包：
 
 ```python
-from api import (
-    assemble, MemoryAPI,               # 入口 + 接口
+from jiuwen_memory.api import (
+    assemble, assemble_runtime, MemoryAPI, MemoryRuntime,  # 入口 + 接口
     Scope, Context, Modality,          # 调用上下文
     MemoryPatch, UpdateMode,           # update
     DeleteSelector, DeleteMode,        # delete
-    FilterClause, FilterOp,            # recall 前置过滤
-    DisclosureLevel, EvolveMode,       # recall / evolve
+    FilterClause, FilterOp,            # search 前置过滤
+    DisclosureLevel, EvolveMode,       # search / evolve
     Grant, Action, Channel,            # 授权 / 演进通道
     SpaceSpec, SpaceInfo, SpacePolicy, # space 管理
+    ValidationError, Credentials,      # Access 错误映射 / 凭据
+    legacy_request_context,            # 过渡期安全上下文
 )
 ```
 
@@ -36,9 +38,12 @@ from api import (
 | 文件 | 角色 |
 |---|---|
 | `local_memory_api.py` · `LocalMemoryAPI` | 单进程下的 `MemoryAPI` 实现——**鉴权（PEP）+ 入口审计 + 委派**，自身不含编排逻辑 |
-| `assembly.py` · `build_kernel`/`assemble`/`Kernel` | 把各层具体实现经 Producer 串成一个可直接调用的内核——「把整个项目串起来」的落点 |
+| `assembly.py` · `assemble` / `assemble_runtime` / `_build_kernel` | 公开装配只返回 `MemoryAPI` 或 `MemoryRuntime`；内部 `_Kernel` 才持有 KV/Storage |
 
-接口层是控制层（`src/control`）的**薄封装**：数据面（write/recall/list/get/update/delete/evolve）委托 `MemoryEngine`，管理面（任务/治理/授权/admin/space 管理）直达对应控制算子；本层只做**参数装配 + 鉴权 + 入口审计**，编排逻辑全在控制层。
+接口层是控制层（`jiuwen_memory/control`）的**薄封装**：数据面经 `control.application` 的
+`MemoryCommandService` / `MemoryQueryService` 委托 `MemoryEngine`，治理经 `GovernanceService`
+委托 `Governor`，`delete_space` 事务经 `SpaceLifecycleService`；任务/策略/space 普通 CRUD
+仍直达对应控制算子。本层只做**参数装配 + 鉴权 + 入口审计**，编排逻辑全在控制层。
 
 ---
 
@@ -48,18 +53,21 @@ from api import (
 
 `LocalMemoryAPI` 是策略执行点（PEP）。每个涉及租户数据/治理的方法，统一走两个私有公共点：
 
-- `_authorize(identity, target, action)` → `PermissionManager.check(...)`，不通过抛 `PermissionDeniedError`；
-- `_log(identity, action, target_id)` → 落一条 `layer="api"` 的入口审计事件（带 identity）。
+- `_authorize(security.auth.actor, target, action)` → `PermissionManager.check(...)`，不通过抛 `PermissionDeniedError`；
+- `_log(security.auth.actor, action, target_id)` → 落一条 `layer="api"` 的入口审计事件（带认证 actor）。
 
-通过后才委托引擎/控制算子，且**只下沉已鉴权的 target `scope`，identity 不下沉**（下游信任 target）。常见「本人操作自己」场景 `identity == scope`。
+通过后才委托引擎/控制算子，且**只下沉已鉴权的 target `scope`，security 不下沉**（下游信任 target）。常见「本人操作自己」场景是 `security.auth.actor == scope`。
 
-### 2. `identity` 一律 keyword-only
+### 2. `security` 一律 keyword-only
 
-每个方法的 `identity` 都在 `*` 之后、必须具名传 `identity=...`。两者同为 `Scope` 类型（target scope 与 caller identity），强制具名可杜绝位置传反导致的**越权**。这是刻意设计，不是风格偏好。
+每个方法的 `security` 都在 `*` 之后、必须具名传 `security=...`；调用方身份只能从
+`security.auth.actor` 取得。这样不会把安全上下文误当成 target `Scope` 传入，也避免调用方
+伪造 actor。`check_write` 为兼容历史调用保留第二个位置参数，但仍要求传入完整的
+`RequestSecurityContext`。
 
 ### 3. Context 只活在接口层，边界处拆包
 
-`recall` 收到的 `Context` 在边界即被拆开，**Context 对象本身不进内核**：
+`search` 收到的 `Context` 在边界即被拆开，**Context 对象本身不进内核**：
 
 - `context.scope` → 照旧作独立轴下推（先鉴权、再作检索隔离轴）；
 - `context.extensions["max_tokens"]` → API 边界解析为 int 后写入 `RetrievalQuery.max_tokens` 由披露阶段消费；
@@ -69,11 +77,11 @@ from api import (
 
 ### 4. 异步内核 + 同步桥接
 
-引擎是异步的。`write_async` 是**直通引擎的真协程**，供事件循环/高并发接入形态（HTTP/MCP）非阻塞调用；同步 `write`（及 recall/list/get/update/delete/evolve）是它的**同步桥接**——内部 `asyncio.run(...)` 包一层，供 CLI/脚本直接调用。一套语义两个入口，避免同步/异步双实现漂移。
+引擎是异步的。`add_async` 是**直通引擎的真协程**，供事件循环/高并发接入形态（HTTP/MCP）非阻塞调用；同步 `add`（及 search/list/get/update/delete/evolve）是它的**同步桥接**——内部 `asyncio.run(...)` 包一层，供 CLI/脚本直接调用。一套语义两个入口，避免同步/异步双实现漂移。
 
 ### 5. 数据面委托引擎，管理面直达控制算子
 
-- **数据面** write/recall/list/get/update/delete/evolve → `MemoryEngine`；
+- **数据面** add/search/list/get/update/delete/evolve → `MemoryEngine`；
 - **管理面** job_status/job_cancel → `Scheduler`，admin_* → `PolicyManager`，inspect/trace/audit → `Governor`，grant/revoke → `PermissionManager`，create/get/list/update/archive/delete/export/usage/policy/member space 管理 → `SpaceManager`。
 
 接口层不替管理面做编排，直达对应控制算子，职责清晰。
@@ -92,26 +100,51 @@ admin（运行时策略）与全局 audit 查询**没有具体 target scope**，
 
 ### 9. 装配（assembly.py）：Producer.dep + 默认上下文 + 合并覆盖 + kv 注入
 
-`build_kernel` 的串接策略：
+`assemble` / `_build_kernel` 的串接策略：
 
 - **取依赖统一走 `dep`**：`XProducer.dep(root, default=...)` 按配置值分派（引用名→`build_named` 共享 / 内联 dict→`build` 匿名 / 缺省→按 `default` 匿名新建）；字段名默认取各 Producer 的 `TOP_NAME`。根组件经 `ROOT_PARAMS` 引用各命名空间下的 `default` 实例。
 - **默认装配**：无 config 时用内置默认上下文（`config.defaults`）——纯内存离线栈，用显式具名 + 引用复刻共享拓扑；用户 config 经 `AssemblyContext.merged` **合并覆盖**到其上（只写要改动的部分）。
 - **policies 便捷覆盖**：`policies` 折进 `globals["policies"]`。
 - **真源 kv 注入**：`kv` 入参经 `KvProducer.put(KV_DEFAULT_NAME, kv)` 预置进缓存，**覆盖配置的 kv_store 选择并被各处共享**（如传 `SQLiteKVStore` 即落盘）。
 - **多次装配隔离**：组装前 `_register_all()`（各层 bootstrap 幂等自注册）+ `Factory.reset_all()` 清空具名实例缓存。
-- **Kernel 多暴露 kv/space 句柄**：`build_kernel` 返回 `Kernel{api, kv, space}`，比 `assemble`（只返回 api）多给真源 kv 与 SpaceManager 句柄，供测试、特殊装配或调试场景观测真源；接入 surface 的普通数据面能力应走 `MemoryAPI`，例如 list 已由 `MemoryAPI.list` 承接。
+- **内部 `_Kernel` 持有统一 Storage 与控制句柄**：`_build_kernel` 返回
+  `_Kernel{api, storage, kv, space, config_source}`，不从 `jiuwen_memory.api` 导出；
+  `assemble` 只返回 api，`assemble_runtime` 只返回 api + close。普通数据面能力应走 `MemoryAPI`。
 
 ```python
-from api import assemble, build_kernel
-from config import Config
+from jiuwen_memory.api import assemble
+from jiuwen_memory.config import Config
 
 api = assemble()                                  # 默认纯内存离线栈
 api = assemble(config=Config(...), policies={"rerank_enabled": "true"})
 api = assemble(kv=SQLiteKVStore("mem.db"))        # 注入落盘真源
-kernel = build_kernel(config=Config(...))         # 另需真源 kv 句柄时
 ```
 
-### 10. list 升级为正式数据面接口
+### 10. HTTP/多 surface 的结构化 dispatch 边界
+
+HTTP 与 CLI 不再经过 MCP 使用的 legacy handler，稳定边界均为 `MemoryAPI` 本身：
+`POST /v1/<method_name>` 的 JSON 字段直接对应同名方法参数，反射 API 签名取得字段集合、
+必填/默认关系和类型注解，再机械构造 `Scope`、`Context`、`MemoryPatch` 等公开对象。
+服务端拒绝未知字段以及 `target`、`item_id`、`k` 等历史 HTTP 别名，避免 DTO 与 API
+再次独立演进。
+
+认证 actor 仍只来自 `RequestSecurityContext.auth.actor`。`security` 不接收请求体输入，HTTP
+认证中间件生成可信上下文后以关键字参数注入同名 API；API 再以公开参数中的 `scope`、
+`selector.scope`、`spec.org/space` 等业务目标完成鉴权与审计。成功返回值不再转换成
+`{ok, op, ...}`，而是按数据类字段、枚举值和 ISO 8601 时间递归序列化。
+
+同步 API 直接调用；`add_async` / `batch_add_async` 按协程契约等待完成并序列化原返回值，
+不转成新的任务模型。`evolve` / `submit_ingest` 保留任务语义，是因为 API 本身就返回任务
+标识或提交结果，而不是 HTTP 根据同步/异步重新解释。
+
+CLI 命令和 `--参数名` 直接从 API 签名生成，所有对象使用与 HTTP 相同的 JSON 结构，
+不再转换旧参数或还原旧返回 envelope。本地 CLI 经受控认证入口直接调用 API，
+远程 CLI 原样发送同名 HTTP 请求。两者共用 `core/api_contract.py`，以及
+`core/error_response.py` 的领域错误映射。本地开发认证须显式使用 `--auth-mode dev`，
+不会根据业务 scope 推导身份。MCP 和旧调用方的 flat 输入仍可经过
+`core/legacy_request_adapter.py` 与 shared handler；详细取舍见 F05。
+
+### 11. list 升级为正式数据面接口
 
 `bootstrap` 表面已有 `list` verb，但此前接口层没有正式 `MemoryAPI.list(...)`，
 容易让不同接入形态各自实现枚举逻辑，甚至把“surface 直扫 KV”误读成长期架构。
@@ -128,11 +161,11 @@ def list(
     self,
     scope: Scope,
     *,
-    identity: Scope,
+    security: RequestSecurityContext,
     offset: int = 0,
     limit: int = 100,
     memory_types: list[str] | None = None,
-    extensions: dict[str, str] | None = None,
+    extensions: dict[str, Any] | None = None,
     filters: FilterExpr | list[FilterClause] | dict | None = None,
 ) -> MemoryListResult:
     ...
@@ -142,7 +175,8 @@ def list(
 
 - `MemoryAPI.list` 做 READ 鉴权、入口审计和参数委托。
 - `MemoryEngine.list` 校验分页参数并把查询参数完整委托 `KVStore.list`。
-- bootstrap `handler._list` 只解析 payload 并委托 `srv.api.list(...)`，不再直连 KV。
+- HTTP / CLI 直接调用 `MemoryAPI.list`；MCP 等旧调用方的 `handler._list` 仍委托
+  `srv.api.list(...)`，不再直连 KV。
 - 返回范围只包含 `/memory/` 前缀的已建索引 `MemoryUnit`，不返回 `/messages/` 下的 infer 原文缓存。
 - list 是范围枚举，不走 `MemoryPipeline`；pipeline 仍只负责构建/查询组件绑定。
 
@@ -158,16 +192,16 @@ KV 层列表语义：
 
 - 校验 `offset >= 0`、`limit > 0`。
 - `KVStore.list` 只加载 `/memory/` 记录。
-- `memory_types` 过滤优先读取 `unit.metadata["memory_type"]`，缺省退回 `unit.tier.value`。
+- `memory_types` 过滤优先读取 `unit.system_metadata["memory_type"]`，缺省退回 `unit.tier.value`。
 - 按 `unit.temporal.t_ingest` 倒序返回，`unit.id` 作为稳定次级排序键。
 - 返回当前页 `items`；响应中的 `count` 是过滤后的分页前总数。
 
-bootstrap payload 兼容：
+legacy handler payload 兼容（仅 MCP 和旧调用方，不适用于 HTTP / CLI）：
 
 | 字段 | 语义 |
 |---|---|
 | `tenant_id` + `scope` | target scope |
-| `actor_*` | 可选调用方身份覆盖，沿用现有 dispatch 身份拆分 |
+| `actor_*` | HTTP / CLI 拒绝；仅保留为 legacy dispatch 调用的兼容输入，不能作为新入口的身份来源 |
 | `offset` | 非负整数，默认 0 |
 | `limit` | 正整数，默认 100 |
 | `memory_types` / `mem_types` / `memory_type` | 记忆类型过滤；可为字符串列表，或逗号分隔字符串 |
@@ -175,7 +209,7 @@ bootstrap payload 兼容：
 拒绝的方案：
 
 - **handler 继续直扫 KV**：绕开 API 鉴权/审计，也会让 SDK/MCP/HTTP 的 list 语义分裂。
-- **复用 recall 返回全量**：会混淆“相关性检索”和“范围枚举”，并受到召回通道、top_k、阈值和披露策略影响。
+- **复用 search 返回全量**：会混淆“相关性检索”和“范围枚举”，并受到召回通道、top_k、阈值和披露策略影响。
 - **list 支持跨 scope**：枚举多个 scope 属于治理/管理能力，不放进普通数据面读接口。
 - **只用 tier 命名过滤参数**：mem1.0 是 `mem_types`，本层选择更中性的 `memory_types`；
   handler 接受 `mem_types` 与 `memory_type` 作为兼容别名。
@@ -187,7 +221,7 @@ bootstrap payload 兼容：
 - `tests/unit/api/test_dispatch_management_compat.py`：bootstrap `list` 委托 `MemoryAPI.list`，
   以及 handler 对 offset/limit/memory_types 的入参校验。
 
-#### 10.1 List 自定义参数、过滤与结果总数增量设计（2026-07-30，已实现）
+#### 11.1 List 自定义参数、过滤与结果总数增量设计（2026-07-30，已实现）
 
 List 需要在“按 Scope 枚举”基础上支持调用方自定义参数和结构化过滤，同时返回过滤后的
 结果总数。目标接口调整为：
@@ -203,30 +237,34 @@ def list(
     self,
     scope: Scope,
     *,
-    identity: Scope,
+    security: RequestSecurityContext,
     offset: int = 0,
     limit: int = 100,
     memory_types: list[str] | None = None,
-    extensions: dict[str, str] | None = None,
+    extensions: dict[str, Any] | None = None,
     filters: FilterExpr | list[FilterClause] | dict | None = None,
 ) -> MemoryListResult:
     ...
 ```
 
-Python API 使用 `filters` 作为规范参数名，与 `recall` 保持一致；bootstrap payload 以
+Python API 使用 `filters` 作为规范参数名，与 `search` 保持一致；bootstrap payload 以
 `filters` 为规范字段，同时兼容调用方使用单数 `filter`。两者同时出现时拒绝请求，避免
 静默选择其中一份条件。
 
 `extensions` 的契约与 `RetrievalQuery.extensions` 一致：
 
-- 类型为 `dict[str, str]`；API 边界复制并把传输层值规范为字符串，避免调用方后续修改
-  原字典影响正在执行的请求。
+- 类型为 `dict[str, Any]`；API 边界只复制外层字典并原样透传值，避免调用方后续修改
+  原字典影响正在执行的请求；内核不得隐式调用 `str()`。
 - 内核默认实现不解释业务 key，必须沿
   `MemoryAPI -> MemoryEngine -> KVStore.list` 完整透传；自定义 Engine 或 KV
   后端可按约定消费，未知 key 不报错。
-- `extensions` 不得改变 `scope`、绕过权限或覆盖系统过滤谓词。若某个扩展值参与权限路由，
-  API 必须像 recall 一样把对应路由值回注为系统等值过滤条件，并与用户 filters 做外层
-  `AND`，确保“按什么条件授权，就只列出什么范围的数据”。
+- `extensions` 不得改变 `scope`、绕过权限或覆盖系统过滤谓词。权限上下文构建只
+  解释 `PermissionManager.routing_fields()` 声明的路由键（extensions 优先、filter
+  等值兜底，与 search 同一口径）；其余扩展值对权限层**不透明**——既不进
+  `PermissionContext.metadata`，也不被 `str()`，调用方无法借扩展键向鉴权入参
+  塞入任意判定依据。参与权限路由的键，API 必须像 search 一样把对应路由值回注为
+  系统等值过滤条件，并与用户 filters 做外层 `AND`，确保“按什么条件授权，就只
+  列出什么范围的数据”。
 - `None` 与空字典都表示没有自定义参数。非字典输入在 API/handler 边界抛
   `ValidationError`，不静默丢弃。
 
@@ -238,7 +276,7 @@ Python API 使用 `filters` 作为规范参数名，与 `recall` 保持一致；
 - Scope 是独立的强隔离轴，`org/space/user/agent/session` 不允许放入 filters；
   用户过滤只能进一步收窄已鉴权的 target Scope，不能扩大查询范围。
 - `memory_types` 保留为兼容快捷参数，与 filters 是 `AND` 关系；类型匹配仍优先读取
-  `unit.metadata["memory_type"]`，缺省退回 `unit.tier.value`。
+  `unit.system_metadata["memory_type"]`，缺省退回 `unit.tier.value`。
 - 规范化后的 filters、`memory_types`、`extensions`、`offset` 和 `limit` 必须由 Engine
   原样下推 KV 查询契约；过滤必须在存储适配器内部先于排序、`offset` 和 `limit` 执行，
   禁止 Engine 先取一页再做后置过滤。
@@ -361,7 +399,7 @@ MemoryAPI
 count；实际资源二次鉴权未通过时整个请求失败，不返回部分 items 或可推断未授权数据规模的
 count。
 
-这一阶段继续以 KV 真源查询保证语义正确，不复用 recall：list 是确定性范围枚举，不应受
+这一阶段继续以 KV 真源查询保证语义正确，不复用 search：list 是确定性范围枚举，不应受
 相关性、召回通道、阈值、top-k 或披露策略影响。简单 KV 后端的兼容回退仍需扫描 Scope
 下全部 `/memory/` 记录，复杂度为 O(N)，但扫描职责封装在 KV 适配器内，Engine 始终使用
 同一个 `list` 契约。生产后端应在分页前完整下推 FilterExpr 并使用原生 count；
@@ -378,7 +416,7 @@ count。
   执行职责仍完整下推 KV 层。
 - **Engine 全量读取后自行过滤**：能实现功能但 extensions 到不了自定义 KV，生产后端也
   无法使用原生 metadata filter/count，且所有 Engine 都会重复扫描逻辑。
-- **复用 recall 实现过滤 List**：会把确定性枚举错误地绑定到相关性检索语义。
+- **复用 search 实现过滤 List**：会把确定性枚举错误地绑定到相关性检索语义。
 
 验证覆盖：
 
@@ -400,9 +438,11 @@ count。
 
 ## 拒绝的方案
 
-- **`identity` 作为位置参数**：被拒。与 target `scope` 同为 `Scope`，位置传反即静默越权；强制 keyword-only 把错误挡在调用处。
+- **`security` 作为位置参数**：被拒。安全上下文必须与 target `scope` 保持不同的类型和
+  参数角色；除 `check_write` 的历史兼容位置外统一强制 keyword-only，避免调用处误传或丢失
+  认证信息。
 - **Context 对象下沉进内核**：被拒。Context 是接口层的打包容器，下沉会让内核耦合「调用形态」；改为边界拆包，scope 独立下推，extensions 中的约定 key 由 API 边界解释，其余 extensions 透传。
-- **接口层承担编排**：被拒。api 层只做 PEP + 参数装配 + 审计，所有编排（write 的规约/索引、recall 的多路召回/融合/披露、evolve 的阶段调度）留在 `src/control` 与各算子层，保证入口薄、可替换接入形态。
+- **接口层承担编排**：被拒。api 层只做 PEP + 参数装配 + 审计，所有编排（add 的规约/索引、search 的多路召回/融合/披露、evolve 的阶段调度）留在 `jiuwen_memory/control` 与各算子层，保证入口薄、可替换接入形态。
 - **管理面也走 MemoryEngine**：被拒。engine 聚焦数据面；任务/策略/治理/授权直达对应控制算子，避免 engine 变成「什么都转发」的上帝对象。
 - **同步实现整套内核**：被拒。内核选异步（适配 HTTP/MCP 高并发），同步入口用 `asyncio.run` 桥接；避免维护同步/异步两份实现导致语义漂移。
 - **admin/全局 audit 按调用方自身 scope 鉴权**：被拒。这类操作无具体 target scope，按自身 scope 判权会让任意用户都「对自己有权」从而绕过管理面；改用根 scope 闸门统一表达管理员权限。
@@ -414,16 +454,21 @@ count。
 
 - 历史基线：`pytest tests/unit/api` 全绿（exit 0）。
   - `test_build_kernel_config`：装配路径——默认上下文、用户 config 合并覆盖、`build_named` 具名共享、顶层名校验、kv 注入。
-  - `test_recall_context`：Context 边界拆包（scope、extensions 约定 key、其余 extensions）与 recall 端到端。
+  - `test_search_context`：Context 边界拆包（scope、extensions 约定 key、其余 extensions）与 search 端到端。
 - 鉴权/审计语义随控制层 `tests/unit/control/` 一并回归（PEP 在接口层，闸门行为在 `allow_all` 与真实 PermissionManager 下分别覆盖）。
 - list 增量：API、handler、CloudEngine、四个 KV 实现、公共过滤求值相关单测通过；
   ruff、compileall 与 `git diff --check` 通过。
+- HTTP / CLI 同名契约：`tests/unit/jiuwen_memory_entry/test_api_contract.py`、
+  `test_http_server_security.py`、`test_cli.py` 覆盖全部方法与参数、嵌套对象和默认值、
+  原返回值、未知/身份字段拒绝、认证上下文清理及本地/HTTP 调用。
+- legacy dispatch 的 `target` 归一化、space 别名冲突与 `DispatchRequest` 边界由
+  `tests/unit/jiuwen_memory_entry/test_handler.py` 保留覆盖，不再描述为 HTTP 兼容契约。
 
 ---
 
 ## 已知遗留
 
-- **同步方法不可在运行中的事件循环内调用**：`write`/`recall`/… 内部 `asyncio.run`，在已有 event loop 的环境（如 async 框架内）须改用 `write_async` 等协程入口，否则 `asyncio.run` 报错。
-- **identity 不下沉 = 下游信任 target**：鉴权只在接口层做一次，下游算子信任传入的 target scope；若未来出现「下游需二次校验」的场景，需要显式传递鉴权上下文。
+- **同步方法不可在运行中的事件循环内调用**：`add`/`search`/… 内部 `asyncio.run`，在已有 event loop 的环境（如 async 框架内）须改用 `add_async` 等协程入口，否则 `asyncio.run` 报错。
+- **security 不下沉 = 下游信任 target**：鉴权只在接口层做一次，下游算子信任传入的 target scope；若未来出现「下游需二次校验」的场景，需要显式传递鉴权上下文。
 - **默认装配是本地 SQLite owner-only ACL**：`assemble()` 默认 `permission=sqlite(db_path=":memory:")`，owner 访问自己的 target scope 默认放行，同租户跨 scope 默认拒绝；测试或开发若要完全放行需显式装配 `allow_all`。
 - **管理面闸门粒度粗**：admin/全局 audit 统一走根 scope，尚无更细的「按策略键/按 layer」分权；待真实 RBAC 后端细化。

@@ -17,14 +17,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+from datetime import UTC
 
 import pytest
 
-from common.base import PluginType
-from common.embedder.base import Embedder
-from common.errors import ConflictError, NotFoundError
-from common.llm.base import LLM
-from common.type_def import (
+from jiuwen_memory.common.base import PluginType
+from jiuwen_memory.common.embedder.base import Embedder
+from jiuwen_memory.common.errors import ConflictError, NotFoundError
+from jiuwen_memory.common.llm.base import LLM
+from jiuwen_memory.common.type_def import (
     MESSAGES_KEY_PREFIX,
     LifecycleState,
     MemoryTier,
@@ -36,16 +37,22 @@ from common.type_def import (
     memory_key,
     messages_key,
 )
-from common.type_def.memory_codec import dumps, loads
-from construction.base import OperatorType
-from construction.dedup_impl.vector_dedup import VectorDedup
-from construction.evolver import EvolveMode
-from construction.evolver_impl.orchestrating_evolver import OrchestratingEvolver
-from construction.extractor import Extractor
-from storage.base import StoreType
-from storage.kv import KVStore
-from storage.types import ScoredID, VectorRecord
-from storage.vector import VectorStore
+from jiuwen_memory.common.type_def.memory_codec import dumps, loads
+from jiuwen_memory.construction.base import OperatorType
+from jiuwen_memory.construction.dedup_impl.vector_dedup import VectorDedup
+from jiuwen_memory.construction.evolver import EvolveMode
+from jiuwen_memory.construction.evolver_impl.orchestrating_evolver import OrchestratingEvolver
+from jiuwen_memory.construction.extractor import Extractor
+from jiuwen_memory.storage.base import StoreType
+from jiuwen_memory.storage.kv import KVStore
+from jiuwen_memory.storage.types import (
+    IndexRemoveMode,
+    IndexWriteMode,
+    ScoredID,
+    VectorRecord,
+)
+from jiuwen_memory.storage.vector import VectorStore
+from tests.conftest import make_storage
 
 pytestmark = pytest.mark.unit
 
@@ -238,6 +245,14 @@ class _ScriptedExtractor(Extractor):
 
 
 class _NoopIndexBuilder:
+    """只交付真源的替身：IndexBuilder 是写入口，不交付则 KV 为空。
+
+    交付走 KV 直写（``memory_key`` + ``dumps``，ForwardIndexBuilder 模式）。
+    """
+
+    def __init__(self, kv) -> None:
+        self._kv = kv
+
     @staticmethod
     def operator_type() -> OperatorType:
         return OperatorType.INDEX_BUILDER
@@ -246,13 +261,15 @@ class _NoopIndexBuilder:
     def health() -> None:
         return None
 
-    def build(self, units):
-        pass
+    def build(self, units, *, mode: IndexWriteMode = IndexWriteMode.ALL):
+        for unit in units:
+            self._kv.insert(unit.scope, memory_key(unit.id), dumps(unit))
 
-    def update(self, units):
-        pass
+    def update(self, units, *, mode: IndexWriteMode = IndexWriteMode.ALL):
+        for unit in units:
+            self._kv.update(unit.scope, memory_key(unit.id), dumps(unit))
 
-    def remove(self, units):
+    def remove(self, units, *, mode: IndexRemoveMode = IndexRemoveMode.HARD):
         pass
 
     def rebuild(self):
@@ -265,7 +282,7 @@ def _make_unit(
     *,
     scope: Scope = _DEFAULT_SCOPE,
     tier: MemoryTier = MemoryTier.EPISODIC,
-    metadata: dict | None = None,
+    system_metadata: dict | None = None,
     t_ingest=None,
 ) -> MemoryUnit:
     return MemoryUnit(
@@ -275,7 +292,7 @@ def _make_unit(
         segments=[Segment(content=content, source=Modality.TEXT)],
         lifecycle=LifecycleState.ACTIVE,
         temporal=Temporal(t_ingest=t_ingest),
-        metadata=dict(metadata or {}),
+        system_metadata=dict(system_metadata or {}),
     )
 
 
@@ -292,14 +309,15 @@ def _index_related(unit: MemoryUnit, kv: KVStore, vector_store: VectorStore, emb
 
 def _make_evolver(kv, vector_store, embedder, llm, extractor) -> OrchestratingEvolver:
     # tier_filter=False：让 EPISODIC 本轮 unit 能召回 SEMANTIC 相关记忆（跨 tier）
-    dedup = VectorDedup(vector_store=vector_store, embedder=embedder, kv=kv, tier_filter=False)
+    storage = make_storage(kv=kv, vector=vector_store)
+    dedup = VectorDedup(storage=storage, embedder=embedder, tier_filter=False)
     return OrchestratingEvolver(
         extractor=extractor,
         abstractor=None,  # EXTRACT 不用
         associator=None,
-        index_builder=_NoopIndexBuilder(),
-        kv=kv,
-        graph=None,
+        index_builder=_NoopIndexBuilder(kv),
+        storage=storage,
+        message_store=storage.kv(),
         dedup=dedup,
         llm=llm,
     )
@@ -319,7 +337,9 @@ class TestInferContextCollection:
         stores = {"kv": _MemoryKVStore(), "vector": _MemoryVectorStore()}
         plugins = {"embedder": _HashEmbedder(), "llm": _MockLLM()}
         extractor = _ScriptedExtractor([_make_unit("ext-1", "新事实")])
-        evolver = _make_evolver(stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor)
+        evolver = _make_evolver(
+            stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor
+        )
 
         unit = _make_unit("u1", "普通消息")  # 无 metadata.infer
         evolver.evolve([unit], EvolveMode.EXTRACT)
@@ -328,11 +348,15 @@ class TestInferContextCollection:
 
     @staticmethod
     def test_infer_collects_recent_originals_and_related():
-        """infer=true → context 含 recent_originals（/messages/ 原文）+ related_memories（召回）。"""
+        """infer=true → context 含 recent_originals（/messages/ 原文）
+        + related_memories（召回）。
+        """
         stores = {"kv": _MemoryKVStore(), "vector": _MemoryVectorStore()}
         plugins = {"embedder": _HashEmbedder(), "llm": _MockLLM()}
         extractor = _ScriptedExtractor([_make_unit("ext-1", "新事实")])
-        evolver = _make_evolver(stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor)
+        evolver = _make_evolver(
+            stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor
+        )
 
         # 预置一条已索引的相关记忆（/memory/，供 dedup.recall 召回）
         # 用与本轮相同文本（HashEmbedder 同文本→cosine=1.0，确保超过 min_similarity 召回）
@@ -340,11 +364,13 @@ class TestInferContextCollection:
         _index_related(related, stores["kv"], stores["vector"], plugins["embedder"])
 
         # 预置一条历史 infer 原文（/messages/，规约后的 MemoryUnit）
-        hist = _make_unit("hist-1", "user: 之前聊过猫\nassistant: 嗯", metadata={"infer": "true"})
+        hist = _make_unit(
+            "hist-1", "user: 之前聊过猫\nassistant: 嗯", system_metadata={"infer": "true"}
+        )
         stores["kv"].insert(_DEFAULT_SCOPE, messages_key(hist.id), dumps(hist))
 
         # 本轮 infer unit（content 与 related 相同，便于召回）
-        cur = _make_unit("cur-1", "用户偏好 Python 编程", metadata={"infer": "true"})
+        cur = _make_unit("cur-1", "用户偏好 Python 编程", system_metadata={"infer": "true"})
         evolver.evolve([cur], EvolveMode.EXTRACT)
 
         ctx = extractor.last_context
@@ -359,22 +385,24 @@ class TestInferContextCollection:
     @staticmethod
     def test_recent_originals_excludes_current_and_sorts_by_occurred_at():
         """recent 按 occurred_at 降序取最近10条，排除本轮自身。"""
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         stores = {"kv": _MemoryKVStore(), "vector": _MemoryVectorStore()}
         plugins = {"embedder": _HashEmbedder(), "llm": _MockLLM()}
         extractor = _ScriptedExtractor([])
-        evolver = _make_evolver(stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor)
+        evolver = _make_evolver(
+            stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor
+        )
 
         # 三条历史原文，不同 t_ingest
         for i, ts in enumerate([3, 1, 2]):
             u = _make_unit(
-                f"hist-{i}", f"msg-{i}", metadata={"infer": "true"},
-                t_ingest=datetime(2026, 1, ts, tzinfo=timezone.utc),
+                f"hist-{i}", f"msg-{i}", system_metadata={"infer": "true"},
+                t_ingest=datetime(2026, 1, ts, tzinfo=UTC),
             )
             stores["kv"].insert(_DEFAULT_SCOPE, messages_key(u.id), dumps(u))
 
-        cur = _make_unit("cur", "本轮", metadata={"infer": "true"})
+        cur = _make_unit("cur", "本轮", system_metadata={"infer": "true"})
         evolver.evolve([cur], EvolveMode.EXTRACT)
 
         ctx = extractor.last_context
@@ -392,13 +420,15 @@ class TestRelatedMemoriesDedup:
         stores = {"kv": _MemoryKVStore(), "vector": _MemoryVectorStore()}
         plugins = {"embedder": _HashEmbedder(), "llm": _MockLLM()}
         extractor = _ScriptedExtractor([_make_unit("ext-1", "新事实")])
-        evolver = _make_evolver(stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor)
+        evolver = _make_evolver(
+            stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor
+        )
 
         # related 与本轮同文本（HashEmbedder 同文本→cosine=1.0，确保超过 min_similarity 召回）
         related = _make_unit("rel-1", "用户偏好 Python 编程", tier=MemoryTier.SEMANTIC)
         _index_related(related, stores["kv"], stores["vector"], plugins["embedder"])
 
-        cur = _make_unit("cur-1", "用户偏好 Python 编程", metadata={"infer": "true"})
+        cur = _make_unit("cur-1", "用户偏好 Python 编程", system_metadata={"infer": "true"})
         evolver.evolve([cur], EvolveMode.EXTRACT)
 
         ctx = extractor.last_context
@@ -415,12 +445,14 @@ class TestRelatedMemoriesDedup:
         plugins = {"embedder": _HashEmbedder(), "llm": _MockLLM()}
         dup_candidate = _make_unit("c-dup", "用户偏好 Python", tier=MemoryTier.SEMANTIC)
         extractor = _ScriptedExtractor([dup_candidate])
-        evolver = _make_evolver(stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor)
+        evolver = _make_evolver(
+            stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor
+        )
 
         related = _make_unit("rel-1", "用户偏好 Python", tier=MemoryTier.SEMANTIC)
         _index_related(related, stores["kv"], stores["vector"], plugins["embedder"])
 
-        cur = _make_unit("cur-1", "用户偏好 Python 编程", metadata={"infer": "true"})
+        cur = _make_unit("cur-1", "用户偏好 Python 编程", system_metadata={"infer": "true"})
         result = evolver.evolve([cur], EvolveMode.EXTRACT)
 
         # 候选与 related 同文本 → _dedup_batch 召回 related（cosine=1.0 ≥ high）判 NOOP → 无新增
@@ -433,12 +465,14 @@ class TestRelatedMemoriesDedup:
         plugins = {"embedder": _HashEmbedder(), "llm": _MockLLM()}
         new_candidate = _make_unit("c-new", "用户在做数据库迁移", tier=MemoryTier.SEMANTIC)
         extractor = _ScriptedExtractor([new_candidate])
-        evolver = _make_evolver(stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor)
+        evolver = _make_evolver(
+            stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor
+        )
 
         related = _make_unit("rel-1", "用户偏好 Python", tier=MemoryTier.SEMANTIC)
         _index_related(related, stores["kv"], stores["vector"], plugins["embedder"])
 
-        cur = _make_unit("cur-1", "用户在做数据库迁移", metadata={"infer": "true"})
+        cur = _make_unit("cur-1", "用户在做数据库迁移", system_metadata={"infer": "true"})
         result = evolver.evolve([cur], EvolveMode.EXTRACT)
 
         assert "c-new" in result.created_ids
@@ -454,17 +488,62 @@ class TestRelatedMemoriesDedup:
         # 候选 content 与历史原文相同
         candidate = _make_unit("c-1", "我喜欢猫", tier=MemoryTier.SEMANTIC)
         extractor = _ScriptedExtractor([candidate])
-        evolver = _make_evolver(stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor)
+        evolver = _make_evolver(
+            stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor
+        )
 
         # 历史原文（/messages/，无向量索引）——不会被 dedup.recall 召回
-        hist = _make_unit("hist-1", "我喜欢猫", metadata={"infer": "true"})
+        hist = _make_unit("hist-1", "我喜欢猫", system_metadata={"infer": "true"})
         stores["kv"].insert(_DEFAULT_SCOPE, messages_key(hist.id), dumps(hist))
 
-        cur = _make_unit("cur-1", "我在养猫", metadata={"infer": "true"})
+        cur = _make_unit("cur-1", "我在养猫", system_metadata={"infer": "true"})
         result = evolver.evolve([cur], EvolveMode.EXTRACT)
 
         # 原文不参与去重 → 候选保留 → ADD 落盘
         assert "c-1" in result.created_ids
+
+
+class TestMessagesUpsertOnRetry:
+    """_add_messages upsert：extract 失败后重试同一 unit.id 不撞 KV insert 拒重。"""
+
+    @staticmethod
+    def test_evolve_retry_after_extract_failure_does_not_raise_conflict():
+        class _FailOnceExtractor(Extractor):
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def operator_type(self) -> OperatorType:
+                return OperatorType.EXTRACTOR
+
+            def health(self) -> None:
+                return None
+
+            def extract(self, units, *, context=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("inject failure")
+                return []
+
+        stores = {"kv": _MemoryKVStore(), "vector": _MemoryVectorStore()}
+        plugins = {"embedder": _HashEmbedder(), "llm": _MockLLM()}
+        extractor = _FailOnceExtractor()
+        evolver = _make_evolver(
+            stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor
+        )
+        unit = _make_unit(
+            "u-retry-1",
+            "alice FAIL_INJECT",
+            system_metadata={"infer": "true", "middle": "true"},
+        )
+        message_store = getattr(evolver, "_message_store")
+
+        with pytest.raises(RuntimeError, match="inject failure"):
+            evolver.evolve([unit], EvolveMode.EXTRACT)
+        assert message_store.exists(_DEFAULT_SCOPE, messages_key(unit.id))
+
+        result = evolver.evolve([unit], EvolveMode.EXTRACT)
+        assert result.created_ids == []
+        assert extractor.calls == 2
 
 
 class TestEngineInferPersist:
@@ -476,31 +555,33 @@ class TestEngineInferPersist:
 
         原文落盘在 evolver 内部（_persist_and_maintain_messages），故用真实 OrchestratingEvolver。
         """
-        from common.chunker.chunker_impl.recursive_chunker import RecursiveChunker
-        from common.normalizer.normalizer_impl.passthrough_normalizer import PassthroughNormalizer
-        from construction.extractor_impl.keyword_extractor import KeywordExtractor
-        from control.engine_impl.in_memory_engine import InMemoryEngine
-        from ingest.ingestor_impl.simple_ingestor import SimpleIngestor
+        from jiuwen_memory.common.chunker.chunker_impl.recursive_chunker import RecursiveChunker
+        from jiuwen_memory.common.normalizer.normalizer_impl.passthrough_normalizer import (
+            PassthroughNormalizer,
+        )
+        from jiuwen_memory.construction.extractor_impl.keyword_extractor import KeywordExtractor
+        from jiuwen_memory.control.engine_impl.in_memory_engine import InMemoryEngine
+        from jiuwen_memory.ingest.ingestor_impl.simple_ingestor import SimpleIngestor
 
         stores = {"kv": _MemoryKVStore(), "vector": _MemoryVectorStore()}
-        dedup = VectorDedup(
-            vector_store=stores["vector"], embedder=_HashEmbedder(), kv=stores["kv"], tier_filter=False
-        )
+        storage = make_storage(kv=stores["kv"], vector=stores["vector"])
+        dedup = VectorDedup(storage=storage, embedder=_HashEmbedder(), tier_filter=False)
         extractor = KeywordExtractor(RecursiveChunker(chunk_size_chars=50, overlap_chars=10))
         evolver = OrchestratingEvolver(
             extractor=extractor, abstractor=None, associator=None,
-            index_builder=_NoopIndexBuilder(), kv=stores["kv"], graph=None,
+            index_builder=_NoopIndexBuilder(stores["kv"]), storage=storage,
+            message_store=storage.kv(),
             dedup=dedup, llm=_MockLLM(),
         )
 
         class _NoopIndex:
-            def build(self, units):
+            def build(self, units, *, mode: IndexWriteMode = IndexWriteMode.ALL):
                 pass
 
-            def update(self, units):
+            def update(self, units, *, mode: IndexWriteMode = IndexWriteMode.ALL):
                 pass
 
-            def remove(self, units):
+            def remove(self, units, *, mode: IndexRemoveMode = IndexRemoveMode.HARD):
                 pass
 
             def rebuild(self):
@@ -518,7 +599,7 @@ class TestEngineInferPersist:
         asyncio.run(engine.write(
             "user: 你好\nassistant: 你好",
             _DEFAULT_SCOPE,
-            metadata={"infer": "true"},
+            system_metadata={"infer": "true"},
         ))
 
         # /messages/ 下应有 1 条 MemoryUnit（规约后字节，由 evolver 落盘）
@@ -526,7 +607,7 @@ class TestEngineInferPersist:
         assert len(msgs) == 1, f"/messages/ 应有 1 条原文，实际 {len(msgs)}"
         unit = loads(msgs[0][1])
         assert unit is not None
-        assert unit.metadata.get("infer") == "true"
+        assert unit.system_metadata.get("infer") == "true"
         assert "你好" in unit.content
         # 派生记忆落 /memory/（真实抽取会产派生 chunk，这里不验派生数量）
 
@@ -567,13 +648,19 @@ class TestProceduralExtract:
             tier=MemoryTier.PROCEDURAL,
         )
         extractor = _ProceduralExtractor(proc_unit)
-        evolver = _make_evolver(stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor)
+        evolver = _make_evolver(
+            stores["kv"], stores["vector"], plugins["embedder"], plugins["llm"], extractor
+        )
 
         # 预置一条已有记忆（若走 dedup.recall 可能召回——procedural 不应走）
         related = _make_unit("rel-1", "目标：查询订单", tier=MemoryTier.SEMANTIC)
         _index_related(related, stores["kv"], stores["vector"], plugins["embedder"])
 
-        cur = _make_unit("cur-1", "user: 查下订单\nassistant: 已返回列表", metadata={"procedural": "true"})
+        cur = _make_unit(
+            "cur-1",
+            "user: 查下订单\nassistant: 已返回列表",
+            system_metadata={"procedural": "true"},
+        )
         result = evolver.evolve([cur], EvolveMode.EXTRACT)
 
         # procedural 收到 context=None（不收集）
@@ -586,35 +673,37 @@ class TestProceduralExtract:
     @staticmethod
     def test_procedural_original_not_in_kv():
         """procedural 原文不落 KV（/messages/ 和 /memory/ 都无原文）。"""
-        from common.normalizer.normalizer_impl.passthrough_normalizer import PassthroughNormalizer
-        from control.engine_impl.in_memory_engine import InMemoryEngine
-        from ingest.ingestor_impl.simple_ingestor import SimpleIngestor
+        from jiuwen_memory.common.normalizer.normalizer_impl.passthrough_normalizer import (
+            PassthroughNormalizer,
+        )
+        from jiuwen_memory.control.engine_impl.in_memory_engine import InMemoryEngine
+        from jiuwen_memory.ingest.ingestor_impl.simple_ingestor import SimpleIngestor
 
         stores = {"kv": _MemoryKVStore(), "vector": _MemoryVectorStore()}
 
         # evolver 用 keyword_extractor（procedural 降级产 1 条原文 PROCEDURAL）
-        from common.chunker.chunker_impl.recursive_chunker import RecursiveChunker
-        from construction.extractor_impl.keyword_extractor import KeywordExtractor
+        from jiuwen_memory.common.chunker.chunker_impl.recursive_chunker import RecursiveChunker
+        from jiuwen_memory.construction.extractor_impl.keyword_extractor import KeywordExtractor
 
-        dedup = VectorDedup(
-            vector_store=stores["vector"], embedder=_HashEmbedder(), kv=stores["kv"], tier_filter=False
-        )
+        storage = make_storage(kv=stores["kv"], vector=stores["vector"])
+        dedup = VectorDedup(storage=storage, embedder=_HashEmbedder(), tier_filter=False)
         extractor = KeywordExtractor(RecursiveChunker(chunk_size_chars=50, overlap_chars=10))
         # keyword_extractor 构造需 chunker + normalizer？看签名——只 chunker
         evolver = OrchestratingEvolver(
             extractor=extractor, abstractor=None, associator=None,
-            index_builder=_NoopIndexBuilder(), kv=stores["kv"], graph=None,
+            index_builder=_NoopIndexBuilder(stores["kv"]), storage=storage,
+            message_store=storage.kv(),
             dedup=dedup, llm=_MockLLM(),
         )
 
         class _NoopIndex:
-            def build(self, units):
+            def build(self, units, *, mode: IndexWriteMode = IndexWriteMode.ALL):
                 pass
 
-            def update(self, units):
+            def update(self, units, *, mode: IndexWriteMode = IndexWriteMode.ALL):
                 pass
 
-            def remove(self, units):
+            def remove(self, units, *, mode: IndexRemoveMode = IndexRemoveMode.HARD):
                 pass
 
             def rebuild(self):
@@ -632,7 +721,7 @@ class TestProceduralExtract:
         derived = asyncio.run(engine.write(
             "user: 帮我查订单\nassistant: 已返回",
             _DEFAULT_SCOPE,
-            metadata={"procedural": "true"},
+            system_metadata={"procedural": "true"},
         ))
 
         # 产 1 条 PROCEDURAL 派生
@@ -652,31 +741,33 @@ class TestProceduralExtract:
         评审 P2：原实现 `if infer:` 落 /messages/，procedural+infer 同传时违反
         「procedural 原文不落 KV」契约。修正为 `if infer and not procedural:`。
         """
-        from common.chunker.chunker_impl.recursive_chunker import RecursiveChunker
-        from common.normalizer.normalizer_impl.passthrough_normalizer import PassthroughNormalizer
-        from construction.extractor_impl.keyword_extractor import KeywordExtractor
-        from control.engine_impl.in_memory_engine import InMemoryEngine
-        from ingest.ingestor_impl.simple_ingestor import SimpleIngestor
+        from jiuwen_memory.common.chunker.chunker_impl.recursive_chunker import RecursiveChunker
+        from jiuwen_memory.common.normalizer.normalizer_impl.passthrough_normalizer import (
+            PassthroughNormalizer,
+        )
+        from jiuwen_memory.construction.extractor_impl.keyword_extractor import KeywordExtractor
+        from jiuwen_memory.control.engine_impl.in_memory_engine import InMemoryEngine
+        from jiuwen_memory.ingest.ingestor_impl.simple_ingestor import SimpleIngestor
 
         stores = {"kv": _MemoryKVStore(), "vector": _MemoryVectorStore()}
-        dedup = VectorDedup(
-            vector_store=stores["vector"], embedder=_HashEmbedder(), kv=stores["kv"], tier_filter=False
-        )
+        storage = make_storage(kv=stores["kv"], vector=stores["vector"])
+        dedup = VectorDedup(storage=storage, embedder=_HashEmbedder(), tier_filter=False)
         extractor = KeywordExtractor(RecursiveChunker(chunk_size_chars=50, overlap_chars=10))
         evolver = OrchestratingEvolver(
             extractor=extractor, abstractor=None, associator=None,
-            index_builder=_NoopIndexBuilder(), kv=stores["kv"], graph=None,
+            index_builder=_NoopIndexBuilder(stores["kv"]), storage=storage,
+            message_store=storage.kv(),
             dedup=dedup, llm=_MockLLM(),
         )
 
         class _NoopIndex:
-            def build(self, units):
+            def build(self, units, *, mode: IndexWriteMode = IndexWriteMode.ALL):
                 pass
 
-            def update(self, units):
+            def update(self, units, *, mode: IndexWriteMode = IndexWriteMode.ALL):
                 pass
 
-            def remove(self, units):
+            def remove(self, units, *, mode: IndexRemoveMode = IndexRemoveMode.HARD):
                 pass
 
             def rebuild(self):
@@ -694,7 +785,7 @@ class TestProceduralExtract:
         asyncio.run(engine.write(
             "user: 查订单\nassistant: 已返回",
             _DEFAULT_SCOPE,
-            metadata={"procedural": "true", "infer": "true"},
+            system_metadata={"procedural": "true", "infer": "true"},
         ))
 
         # procedural 优先：原文不落 /messages/（即使 infer=true）
@@ -710,7 +801,7 @@ class TestProceduralSourceRef:
         """llm_extractor 的 procedural 产出 source_ref 为空（与 keyword 对齐）。"""
         import json as _json
 
-        from construction.extractor_impl.llm_extractor import ExtractorImpl
+        from jiuwen_memory.construction.extractor_impl.llm_extractor import ExtractorImpl
 
         # MockLLM 返回 procedural JSON（content 字段）
         class _ProcLLM(LLM):
@@ -733,7 +824,7 @@ class TestProceduralSourceRef:
             id="cur-1", scope=Scope(org="t", user="u"),
             segments=[Segment(content="user: 查单\nassistant: 已返", source=Modality.TEXT)],
             lifecycle=LifecycleState.ACTIVE, temporal=Temporal(),
-            metadata={"procedural": "true"},
+            system_metadata={"procedural": "true"},
         )
         result = extractor.extract([source])
         assert len(result) == 1
