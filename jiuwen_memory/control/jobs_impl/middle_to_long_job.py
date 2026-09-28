@@ -240,17 +240,22 @@ class MiddleToLongJob(Job):
                     temperature=0,
                     max_tokens=32,
                 )
+                # 后端异常时可能返回 None 或非字符串——安全归一化，避免 .lower() 抛
+                # AttributeError 逃出重试兜底。
+                text = resp if isinstance(resp, str) else ("" if resp is None else str(resp))
                 try:
-                    result = json.loads(resp)
+                    result = json.loads(text)
                     # LLM 偶尔返回 {"results":[true]}（bool）而非字符串——强制 str
                     # 归一化，否则后续 `cont == "true"` 比较会错误切批。
                     return str(result["results"][0]).lower()
                 except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-                    m = re.search(r"\b(true|false)\b", resp.lower())
+                    m = re.search(r"\b(true|false)\b", text.lower())
                     if m:
                         return m.group(1)
                     raise
-            except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+                # 网络/超时/连接类异常（openai APITimeoutError/APIConnectionError 等）
+                # 同样纳入重试兜底——网络抖动是 LLM 调用最常见失败模式，不应中断任务。
+            except Exception as e:
                 if attempt < _MAX_RETRIES - 1:
                     continue
                 logger.warning(
