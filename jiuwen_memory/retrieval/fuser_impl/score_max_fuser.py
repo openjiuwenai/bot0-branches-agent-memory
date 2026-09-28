@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 
+from jiuwen_memory.common.errors import ValidationError
 from jiuwen_memory.common.type_def import ScoredCandidate
 from jiuwen_memory.retrieval.base import RetrievalOperatorType
 from jiuwen_memory.retrieval.fuser import Fuser, FuserProducer
@@ -53,7 +54,13 @@ class ScoreMaxFuser(Fuser):
                 try:
                     channel = RecallChannel(raw_channel)
                 except ValueError:
-                    channel = RecallChannel[raw_channel.upper()]
+                    try:
+                        channel = RecallChannel[raw_channel.upper()]
+                    except KeyError:
+                        allowed = ", ".join(item.value for item in RecallChannel)
+                        raise ValidationError(
+                            f"invalid recall channel {raw_channel!r}, must be one of: {allowed}"
+                        ) from None
             normalized[channel] = float(raw_weight)
         return normalized
 
