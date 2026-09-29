@@ -241,8 +241,15 @@ class MiddleToLongJob(Job):
                     max_tokens=32,
                 )
                 # 后端异常时可能返回 None 或非字符串——安全归一化，避免 .lower() 抛
-                # AttributeError 逃出重试兜底。
-                text = resp if isinstance(resp, str) else ("" if resp is None else str(resp))
+                # AttributeError 逃出重试兜底。dict/list 等结构化对象经 json.dumps
+                # 转为合法 JSON 字符串（而非 Python repr 的单引号），使后续
+                # json.loads 能正确解析。
+                if isinstance(resp, str):
+                    text = resp
+                elif resp is None:
+                    text = ""
+                else:
+                    text = json.dumps(resp)
                 try:
                     result = json.loads(text)
                     # LLM 偶尔返回 {"results":[true]}（bool）而非字符串——强制 str

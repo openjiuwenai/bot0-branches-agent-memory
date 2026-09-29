@@ -132,13 +132,18 @@ class _ScriptedLLM(LLM):
         return None
 
     def chat(self, messages: list[ChatMessage], **options: object) -> str:
+        """返回预设响应；Exception 抛出模拟失败，None/dict 模拟非 str 后端。
+
+        返回类型标注为 ``str`` 以满足 ``LLM`` 契约，但测试刻意注入 None / dict
+        以验证 ``_check_continuity`` 的非 str 安全归一化。
+        """
         self.chat_calls.append(messages)
         if not self._responses:
             return '{"results":["true"]}'
         r = self._responses.pop(0)
         if isinstance(r, Exception):
             raise r
-        return r
+        return r  # type: ignore[return-value]
 
 
 # ---- 工厂 ----
@@ -348,6 +353,52 @@ def test_check_continuity_succeeds_on_second_attempt() -> None:
 
     assert result == "false"
     assert len(llm.chat_calls) == 2
+
+
+def test_check_continuity_retries_on_network_exception_then_defaults_true() -> None:
+    """LLM 调用抛网络异常（APITimeoutError 等）→ 纳入重试兜底，最终默认 "true"。"""
+    scope = Scope(user="u1")
+    job, _, _, _, llm = _build_job(scope, InMemoryKVStore())
+    llm._responses = [  # pylint: disable=protected-access
+        ConnectionError("simulated timeout"),
+        ConnectionError("simulated connection reset"),
+        ConnectionError("simulated dns failure"),
+    ]
+    prev = _make_unit("p", scope, "p")
+    cur = _make_unit("c", scope, "c")
+
+    result = asyncio.run(job._check_continuity(prev, cur))  # pylint: disable=protected-access
+
+    assert result == "true"
+    assert len(llm.chat_calls) == 3  # 重试 3 次
+
+
+def test_check_continuity_handles_none_response() -> None:
+    """LLM 返回 None → 安全归一化为空串，走正则兜底失败后默认 "true"。"""
+    scope = Scope(user="u1")
+    job, _, _, _, llm = _build_job(scope, InMemoryKVStore())
+    llm._responses = [None, None, None]  # pylint: disable=protected-access
+    prev = _make_unit("p", scope, "p")
+    cur = _make_unit("c", scope, "c")
+
+    result = asyncio.run(job._check_continuity(prev, cur))  # pylint: disable=protected-access
+
+    assert result == "true"
+    assert len(llm.chat_calls) == 3
+
+
+def test_check_continuity_handles_dict_response() -> None:
+    """后端返回 dict（而非 str）→ json.dumps 转为合法 JSON，正确解析。"""
+    scope = Scope(user="u1")
+    job, _, _, _, llm = _build_job(scope, InMemoryKVStore())
+    llm._responses = [{"results": ["true"]}]  # pylint: disable=protected-access
+    prev = _make_unit("p", scope, "p")
+    cur = _make_unit("c", scope, "c")
+
+    result = asyncio.run(job._check_continuity(prev, cur))  # pylint: disable=protected-access
+
+    assert result == "true"
+    assert len(llm.chat_calls) == 1
 
 
 # ---- _split_by_continuity ----
