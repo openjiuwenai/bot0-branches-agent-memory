@@ -246,16 +246,15 @@ def test_weighted_rrf_channel_name_variants_accepted(raw_channel) -> None:
     """成员值精确匹配与成员名大小写变体都解析成功，指向同一枚举成员。"""
     fuser = WeightedRRFFuser(k=0, channel_weights={raw_channel: 2.0})
 
-    assert fuser._channel_weights == {RecallChannel.VECTOR: 2.0} if raw_channel.lower() == "vector" else (
-        fuser._channel_weights == {RecallChannel.KEYWORD: 2.0}
-    )
+    expected = "vector=2" if raw_channel.lower() == "vector" else "keyword=2"
+    assert fuser.explain()["channel_weights"] == expected
 
 
 @pytest.mark.parametrize("raw_channel", ["vector", "VECTOR", "Vector"])
 def test_score_max_channel_name_variants_accepted(raw_channel) -> None:
     fuser = ScoreMaxFuser(channel_weights={raw_channel: 1.5})
 
-    assert fuser._channel_weights == {RecallChannel.VECTOR: 1.5}
+    assert fuser.explain()["channel_weights"] == "vector=1.5"
 
 
 @pytest.mark.parametrize("raw_channel", ["vec", "not_a_channel", ""])
@@ -281,7 +280,4 @@ def test_weighted_rrf_channel_name_variants_still_work() -> None:
     """大小写变体经回退分支解析，权重正常生效（回退分支一直工作，非死代码）。"""
     fuser = WeightedRRFFuser(k=0, channel_weights={"KEYWORD": 2.0, "Vector": 1.0})
 
-    assert fuser._channel_weights == {
-        RecallChannel.KEYWORD: 2.0,
-        RecallChannel.VECTOR: 1.0,
-    }
+    assert fuser.explain()["channel_weights"] == "keyword=2,vector=1"
