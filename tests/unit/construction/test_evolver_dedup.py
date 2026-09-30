@@ -965,9 +965,11 @@ class TestDedupMiddleFilter:
         from jiuwen_memory.storage.types import Document
 
         kv = _MemoryKVStore()
-        fulltext = InMemoryFulltextStore(tokenizer=WhitespaceTokenizer())
+        tokenizer = WhitespaceTokenizer()
+        fulltext = InMemoryFulltextStore(tokenizer=tokenizer)
         dedup = KeywordDedup(
             storage=make_storage(kv=kv, fulltext=fulltext),
+            tokenizer=tokenizer,
             min_similarity=0.0,
             top_k=10,
             tier_filter=False,
