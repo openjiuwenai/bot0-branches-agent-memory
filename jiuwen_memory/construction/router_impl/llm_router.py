@@ -22,6 +22,7 @@ from jiuwen_memory.common.llm.base import LLM, LlmProducer
 from jiuwen_memory.common.log import get_logger, metadata_for_log
 from jiuwen_memory.common.type_def import ChatMessage, MemoryUnit
 from jiuwen_memory.construction.base import OperatorType
+from jiuwen_memory.construction.prompt_guard import truncate_unit_content
 from jiuwen_memory.construction.router import (
     RouteContext,
     RouteDecision,
@@ -121,7 +122,9 @@ class LLMRouter(Router):
             ChatMessage(
                 role="user",
                 content="\n".join(
-                    _SOURCE_PREFIX.format(unit_id=unit.id, unit_content=unit.content)
+                    _SOURCE_PREFIX.format(
+                        unit_id=unit.id, unit_content=truncate_unit_content(unit.content)
+                    )
                     for unit in units
                 ),
             ),
