@@ -1,7 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """最小实现：:class:`~storage.fulltext.FulltextStore` 的纯内存全文存储。
 
-按 scope 原生隔离（scope 折成命名空间键），用词重叠计分模拟 BM25 的 top-k
+按 scope 原生隔离（scope 折成命名空间键），用 BM25 相关性得分返回 top-k
 召回。分词复用注入的 :class:`~common.tokenizer.base.Tokenizer`，与构建侧同一
 实例即同词表。无外部依赖。
 """
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+from jiuwen_memory.common.bm25 import bm25_scores
 from jiuwen_memory.common.errors import ConflictError, NotFoundError
 from jiuwen_memory.common.tokenizer import Tokenizer
 from jiuwen_memory.common.tokenizer.base import TokenizerProducer
@@ -27,7 +28,7 @@ def _skey(scope: Scope) -> _ScopeKey:
 
 
 class InMemoryFulltextStore(FulltextStore):
-    """纯内存全文存储：按 scope 隔离，词重叠计分模拟 BM25 的 top-k 召回。"""
+    """纯内存全文存储：按 scope 隔离，返回原始 BM25 分的 top-k 召回。"""
 
     def __init__(self, tokenizer: Tokenizer) -> None:
         self._tokenizer = tokenizer
@@ -73,14 +74,12 @@ class InMemoryFulltextStore(FulltextStore):
         q_tokens = self._tokenizer.tokenize(query.text)
         if not q_tokens:
             return []
-        q_set = set(q_tokens)
+        docs = self._tokens[key]
         scored: list[ScoredID] = []
-        for doc_id, tokens in self._tokens[key].items():
-            if not tokens:
-                continue
-            hits = sum(1 for t in tokens if t in q_set)
-            if hits:
-                scored.append(ScoredID(id=doc_id, score=hits / len(tokens)))
+        scores = bm25_scores(list(docs.values()), q_tokens)
+        scored.extend(
+            ScoredID(id=doc_id, score=score) for doc_id, score in zip(docs, scores) if score > 0.0
+        )
         scored.sort(key=lambda s: s.score, reverse=True)
         return scored[: query.top_k]
 

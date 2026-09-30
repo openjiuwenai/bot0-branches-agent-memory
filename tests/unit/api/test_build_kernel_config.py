@@ -293,3 +293,25 @@ def test_security_namespace_params_apply_on_encrypted_kv_target() -> None:
     getattr(encrypted, "_raw").insert(SCOPE, "plain_key", b"hello-plaintext")
     with pytest.raises(BackendError):
         kernel.kv.get(SCOPE, "plain_key")
+
+def test_dedup_default_assembly_follows_vector_switch() -> None:
+    """fulltext-only 默认链路必须真正切换到 KeywordDedup。"""
+    from jiuwen_memory.common.tokenizer.base import TokenizerProducer
+    from jiuwen_memory.config.defaults import default_context
+    from jiuwen_memory.construction.dedup_impl.keyword_dedup import KeywordDedup
+    from jiuwen_memory.construction.dedup_impl.vector_dedup import VectorDedup
+    from jiuwen_memory.construction.evolver import EvolverProducer
+
+    kernel = build_kernel(config=Config.from_dict({"globals": {"vector_enabled": False}}))
+    evolver = kernel.api._engine._evolver
+    assert isinstance(evolver._dedup, KeywordDedup)
+    assert evolver._dedup._tokenizer is evolver._dedup._fulltext._tokenizer
+    assert TokenizerProducer.build_named("default", default_context()) is evolver._dedup._tokenizer
+
+    ctx = default_context()
+    ctx.globals["vector_enabled"] = False
+    dynamic = EvolverProducer.build_named("dynamic", ctx)
+    assert isinstance(dynamic._dedup, KeywordDedup)
+
+    vector_kernel = build_kernel()
+    assert isinstance(vector_kernel.api._engine._evolver._dedup, VectorDedup)

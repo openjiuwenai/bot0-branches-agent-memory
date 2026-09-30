@@ -35,7 +35,7 @@ from jiuwen_memory.common.type_def.chat import ChatMessage
 from jiuwen_memory.construction.abstractor import AbstractorProducer
 from jiuwen_memory.construction.associator import AssociatorProducer
 from jiuwen_memory.construction.base import ExtractContext
-from jiuwen_memory.construction.dedup import DedupProducer
+from jiuwen_memory.construction.dedup import resolve_dedup
 from jiuwen_memory.construction.evolver import EvolveResult, EvolverProducer
 from jiuwen_memory.construction.evolver_impl.dedup_direct_noop import should_direct_noop
 from jiuwen_memory.construction.evolver_impl.orchestrating_evolver import (
@@ -385,7 +385,6 @@ def _build(config):
     """
     vector_on = config.get("vector_enabled", True)
     ib_default = "hybrid" if vector_on else "fulltext"
-    dr_default = "vector" if vector_on else "keyword"
 
     def _opt_annotator():
         from jiuwen_memory.construction.layer_annotator import LayerAnnotatorProducer
@@ -414,7 +413,7 @@ def _build(config):
         index_builder=IndexBuilderProducer.dep(config, "index_builder", default=ib_default),
         storage=StoreManagerProducer.resolve(config),
         message_store=_resolve_message_store(config),
-        dedup=DedupProducer.dep(config, default=dr_default),
+        dedup=resolve_dedup(config, vector_enabled=vector_on),
         llm=LlmProducer.dep(config, default="echo"),
         layer_annotator=_opt_annotator(),
         router=optional_router(config),

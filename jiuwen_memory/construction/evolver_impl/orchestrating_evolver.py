@@ -52,7 +52,7 @@ from jiuwen_memory.common.type_def.memory_codec import dumps, loads
 from jiuwen_memory.construction.abstractor import Abstractor, AbstractorProducer
 from jiuwen_memory.construction.associator import Associator, AssociatorProducer
 from jiuwen_memory.construction.base import ExtractContext, OperatorType
-from jiuwen_memory.construction.dedup import Dedup, DedupProducer
+from jiuwen_memory.construction.dedup import Dedup, resolve_dedup
 from jiuwen_memory.construction.evolver import EvolveMode, Evolver, EvolveResult, EvolverProducer
 from jiuwen_memory.construction.evolver_impl.dedup_direct_noop import should_direct_noop
 from jiuwen_memory.construction.extractor import Extractor, ExtractorProducer
@@ -1096,7 +1096,6 @@ def _build(config):
     # 会使去重失效，故此时改用倒排召回）。
     vector_on = config.get("vector_enabled", True)
     ib_default = "hybrid" if vector_on else "fulltext"
-    dr_default = "vector" if vector_on else "keyword"
     # layer_annotator 可选：本 evolver params 显式声明 ``layer_annotator`` 时按它取
     # （None/空串 → 显式禁用，视频 profile 用此关闭 L0/L1 标注，对齐 F05；
     # 命名字符串 → 用该具名实例）；键不存在时回退全局 namespace ``default``（向后兼容）。
@@ -1122,7 +1121,7 @@ def _build(config):
         index_builder=IndexBuilderProducer.dep(config, "index_builder", default=ib_default),
         storage=StoreManagerProducer.resolve(config),
         message_store=_resolve_message_store(config),
-        dedup=DedupProducer.dep(config, default=dr_default),
+        dedup=resolve_dedup(config, vector_enabled=vector_on),
         llm=LlmProducer.dep(config, default="echo"),
         layer_annotator=_opt_annotator(),
         router=optional_router(config),
