@@ -242,7 +242,7 @@ def test_embed_nan_sanitized_no_normalize():
         assert not math.isinf(v)
 
 
-def test_fp16_disabled_on_cpu(monkeypatch):
+def test_fp16_disabled_on_cpu(monkeypatch, tmp_path):
     """T-BM3-16: CPU-only 运行时（cuda 不可用）下，use_fp16=true 被强制降为 fp32。
 
     防止 torch>=2.x meta device 触发 "Cannot copy out of meta tensor" 错误。
@@ -253,6 +253,10 @@ def test_fp16_disabled_on_cpu(monkeypatch):
     fake_mod = types.ModuleType("FlagEmbedding")
     fake_mod.BGEM3FlagModel = MockBGEM3Model
     monkeypatch.setitem(sys.modules, "FlagEmbedding", fake_mod)
+    monkeypatch.setattr(
+        "jiuwen_memory.common.embedder.embedder_impl.bge_m3_embedder.resolve_model_source",
+        lambda *_args, **_kwargs: str(tmp_path),
+    )
     # mock torch.cuda.is_available 返回 False（CPU 环境）
     pytest.importorskip("torch")
     import torch
@@ -264,13 +268,17 @@ def test_fp16_disabled_on_cpu(monkeypatch):
     assert getattr(embedder, "_model").use_fp16 is False, "CPU 下 use_fp16 应被强制降为 False"
 
 
-def test_fp16_kept_on_cuda(monkeypatch):
+def test_fp16_kept_on_cuda(monkeypatch, tmp_path):
     """T-BM3-17: CUDA 可用时，use_fp16=true 保持不变。"""
     import sys
     import types
     fake_mod = types.ModuleType("FlagEmbedding")
     fake_mod.BGEM3FlagModel = MockBGEM3Model
     monkeypatch.setitem(sys.modules, "FlagEmbedding", fake_mod)
+    monkeypatch.setattr(
+        "jiuwen_memory.common.embedder.embedder_impl.bge_m3_embedder.resolve_model_source",
+        lambda *_args, **_kwargs: str(tmp_path),
+    )
     pytest.importorskip("torch")
     import torch
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)

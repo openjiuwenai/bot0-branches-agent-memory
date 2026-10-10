@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from jiuwen_memory.common.errors import StorageRetrievalError, ValidationError
+from jiuwen_memory.common.errors import BackendError, StorageRetrievalError, ValidationError
+from jiuwen_memory.common.reranker.base import Reranker
 from jiuwen_memory.common.type_def import (
     MemoryUnit,
     ParsedQuery,
@@ -88,6 +89,22 @@ class SimpleDiscloser(Discloser):
             )
             for candidate in candidates
         ]
+
+
+class FailingReranker(Reranker):
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def plugin_type(self):
+        from jiuwen_memory.common.base import PluginType
+
+        return PluginType.RERANKER
+
+    def health(self) -> None:
+        return None
+
+    def rerank(self, query: str, texts: list[str]) -> list[float]:
+        raise self.error
 
 
 class CountingKVStore(InMemoryKVStore):
@@ -201,3 +218,35 @@ def test_explicit_empty_channels_are_invalid() -> None:
 
     with pytest.raises(ValidationError):
         retriever.retrieve(scope, RetrievalQuery(text="one", channels=[]))
+
+
+def test_backend_reranker_failure_degrades_to_uncalibrated_results() -> None:
+    retriever, _, _, scope = _build_retriever(
+        RetrievalPipeline.RECALL_GET_RANK,
+        [IdRecaller(RecallChannel.KEYWORD, "u1")],
+    )
+    retriever._reranker = FailingReranker(BackendError("model unavailable"))
+    retriever._min_score = 0.99
+
+    result = retriever.retrieve(
+        scope, RetrievalQuery(text="one", top_k=1, with_trajectory=True)
+    )
+
+    assert [item.unit_id for item in result.items] == ["u1"]
+    rerank_step = next(step for step in result.trajectory if step.stage == "rerank")
+    assert rerank_step.detail["skipped"] == "reranker_unavailable"
+    assert rerank_step.detail["error"] == "model unavailable"
+    assert type(rerank_step.detail["error"]) is str
+    threshold_step = next(step for step in result.trajectory if step.stage == "threshold")
+    assert threshold_step.detail["calibrated"] == "False"
+
+
+def test_non_backend_reranker_failure_is_not_swallowed() -> None:
+    retriever, _, _, scope = _build_retriever(
+        RetrievalPipeline.RECALL_GET_RANK,
+        [IdRecaller(RecallChannel.KEYWORD, "u1")],
+    )
+    retriever._reranker = FailingReranker(ValueError("invalid reranker output"))
+
+    with pytest.raises(ValueError, match="invalid reranker output"):
+        retriever.retrieve(scope, RetrievalQuery(text="one", top_k=1))

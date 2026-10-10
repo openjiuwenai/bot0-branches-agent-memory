@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from jiuwen_memory.common._support import resolve_model_source
 from jiuwen_memory.common.base import PluginType
 from jiuwen_memory.common.errors import HealthCheckError
 from jiuwen_memory.common.log import get_logger
@@ -66,9 +67,12 @@ class BGEReranker(Reranker):
         return scores
 
     def _load_model(self) -> None:
-        """延迟加载模型，避免默认轻量环境在 import 阶段触发重依赖。"""
+        """延迟加载本地模型，避免默认轻量环境在 import 阶段触发重依赖。"""
         if self._model is not None:
             return
+        model_source = resolve_model_source(
+            self._model_name_or_path, component="BGEReranker"
+        )
         try:
             from FlagEmbedding import FlagReranker
         except ImportError:
@@ -79,10 +83,17 @@ class BGEReranker(Reranker):
 
         logger.info(
             "BGEReranker: loading model %s (fp16=%s)",
-            self._model_name_or_path,
+            model_source,
             self._use_fp16,
         )
-        self._model = FlagReranker(self._model_name_or_path, use_fp16=self._use_fp16)
+        try:
+            self._model = FlagReranker(model_source, use_fp16=self._use_fp16)
+        except Exception as exc:
+            from jiuwen_memory.common.errors import BackendError
+
+            raise BackendError(
+                f"BGEReranker: failed to load model {model_source}: {exc}."
+            ) from exc
         logger.info("BGEReranker: model loaded successfully")
 
     def _compute_score(self, pairs: list[list[str]]) -> list[float]:
